@@ -67,4 +67,23 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+        run: |
+          cat > notes.md <<'NOTES'
+          ## Downloads
+
+          | System | Archive |
+          |---|---|
+          | Windows (64-bit) | `*-windows-x86_64.zip` |
+          | Linux x86_64 (static) | `*-linux-x86_64.tar.gz` |
+          | Linux ARM64 (static) | `*-linux-aarch64.tar.gz` |
+          | macOS (Apple silicon) | `*-macos-aarch64.tar.gz` |
+
+          > **Building from source is still recommended.** These binaries are built by GitHub Actions from this tag for convenience, but they are not code-signed. Building takes under a minute with Rust 1.88+:
+          > `cargo install --git https://github.com/awake-devel/pkg-to-anyps5 --tag ${GITHUB_REF_NAME}`
+          >
+          > If you use a binary, check it against `SHA256SUMS.txt`.
+
+          See the [wiki](https://github.com/awake-devel/pkg-to-anyps5/wiki) for usage, and read the README's Legal section before use.
+          NOTES
+          sed -i "s/\${GITHUB_REF_NAME}/$GITHUB_REF_NAME/" notes.md
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --notes-file notes.md --generate-notes

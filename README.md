@@ -11,18 +11,21 @@ files out for the relinker.
 
 ## Install
 
-Download a ready-made binary for Windows, Linux (x86_64, aarch64) or macOS
-(Apple silicon) from the
-[releases page](https://github.com/awake-devel/pkg-to-anyps5/releases), unpack
-it and run `pkg-to-anyps5` (`pkg-to-anyps5.exe` on Windows) from a terminal.
-
-Or build it with Rust 1.88 or newer:
+**Building it yourself is recommended.** It takes under a minute, needs only
+Rust 1.88 or newer, and you run code you can read rather than a binary you
+have to trust:
 
 ```sh
 cargo install --git https://github.com/awake-devel/pkg-to-anyps5
 # or, from a clone
 cargo build --release   # binary at target/release/pkg-to-anyps5
 ```
+
+Ready-made binaries for Windows, Linux (x86_64, aarch64) and macOS (Apple
+silicon) are on the
+[releases page](https://github.com/awake-devel/pkg-to-anyps5/releases) for
+convenience. They are built by GitHub Actions from the tagged source, but they
+are not code-signed, so check them against `SHA256SUMS.txt`.
 
 No dependencies beyond the Rust standard library. The
 [wiki](https://github.com/awake-devel/pkg-to-anyps5/wiki) has a step-by-step
