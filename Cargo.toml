@@ -1,0 +1,16 @@
+[package]
+name = "pkg-to-anyps5"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-3.0-or-later"
+description = "Extract a PS5 debug package (FIH) into the input and runtime layout the AnyPS5 relinker expects"
+repository = "https://github.com/awake-devel/pkg-to-anyps5"
+readme = "README.md"
+keywords = ["ps5", "pkg", "pfs", "kraken", "anyps5"]
+categories = ["command-line-utilities", "emulators"]
+
+[dependencies]
+
+[profile.release]
+debug = 1
