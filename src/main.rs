@@ -57,6 +57,9 @@ const MAX_NAPS_SIZE: u64 = 1 << 30;
 /// Executables are unwrapped in memory; anything larger is a corrupt size.
 const MAX_EXECUTABLE_SIZE: u64 = 2 << 30;
 
+/// Report progress in rough 4 MiB steps while large game files are copied.
+const PROGRESS_INTERVAL: u64 = 4 << 20;
+
 enum Parsed {
     Run(Options),
     Help,
@@ -299,10 +302,11 @@ fn copy_resources(image: &InnerImage, files: &[&InnerFile], app0: &Path, jobs: u
                     let result = copy_one(image, file, app0, &failed, |n| {
                         let done = written.fetch_add(n, Ordering::Relaxed) + n;
                         let due = next_report.load(Ordering::Relaxed);
-                        if done >= due && next_report.compare_exchange(due, done + (4 << 30), Ordering::Relaxed, Ordering::Relaxed).is_ok()
-                        {
-                            let rate = gib(done) / started.elapsed().as_secs_f64().max(0.001);
-                            println!("  app0/  {:.2} / {:.2} GiB ({:.2} GiB/s)", gib(done), gib(total), rate);
+                        if let Some(next_due) = next_progress_due(done, due) {
+                            if next_report.compare_exchange(due, next_due, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                                let rate = gib(done) / started.elapsed().as_secs_f64().max(0.001);
+                                println!("  app0/  {:.2} / {:.2} GiB ({:.2} GiB/s)", gib(done), gib(total), rate);
+                            }
                         }
                     });
                     if let Err(err) = result {
@@ -443,6 +447,14 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
     })
 }
 
+fn next_progress_due(done: u64, due: u64) -> Option<u64> {
+    if done >= due {
+        Some(done + PROGRESS_INTERVAL)
+    } else {
+        None
+    }
+}
+
 fn gib(bytes: u64) -> f64 {
     bytes as f64 / (1u64 << 30) as f64
 }
@@ -450,6 +462,14 @@ fn gib(bytes: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_is_reported_every_4_mib() {
+        assert_eq!(next_progress_due(0, 0), Some(PROGRESS_INTERVAL));
+        assert_eq!(next_progress_due(3 << 20, 0), Some((3 << 20) + PROGRESS_INTERVAL));
+        assert_eq!(next_progress_due(4 << 20, 4 << 20), Some(8 << 20));
+        assert_eq!(next_progress_due(1 << 20, 4 << 20), None);
+    }
 
     #[test]
     fn only_the_executable_and_top_level_modules_go_to_source() {
