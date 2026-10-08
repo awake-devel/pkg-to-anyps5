@@ -347,10 +347,26 @@ fn copy_one(image: &InnerImage, file: &InnerFile, app0: &Path, failed: &AtomicBo
 /// Joins a package path to an output directory, refusing any path that
 /// could reach outside it.
 fn join_inside(base: &Path, relative: &str) -> Result<PathBuf> {
-    if !fih::is_plain_relative_path(relative) {
+    if !fih::is_plain_relative_path(relative) || (cfg!(windows) && !is_windows_safe_path(relative)) {
         return Err(Error::format(format!("refusing to write the unsafe package path {relative:?}")));
     }
     Ok(base.join(relative))
+}
+
+/// Windows opens device names such as `CON` or `nul.txt` instead of a file,
+/// strips trailing dots and spaces, and forbids a few characters.
+fn is_windows_safe_path(relative: &str) -> bool {
+    const DEVICES: [&str; 22] = [
+        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4",
+        "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    ];
+    relative.split('/').all(|part| {
+        let stem = part.split('.').next().unwrap_or(part).trim_end().to_ascii_lowercase();
+        !DEVICES.contains(&stem.as_str())
+            && !part.ends_with(['.', ' '])
+            && !part.contains(['<', '>', '"', '|', '?', '*'])
+            && !part.chars().any(|c| c.is_control())
+    })
 }
 
 /// Files the relinker reads from beside its input: the executable and the
@@ -374,7 +390,7 @@ fn is_game_module(path: &str) -> bool {
 }
 
 fn relink(build: &Path, out: &Path, windows: bool, module_dirs: &[String]) -> Result<()> {
-    let relinker = build.join("core/relinker/relinker");
+    let relinker = build.join(format!("core/relinker/relinker{}", std::env::consts::EXE_SUFFIX));
     let libs = build.join("core/libs/libs");
     if !relinker.is_file() {
         return Err(Error::format(format!("no relinker at {}", relinker.display())));
@@ -393,6 +409,7 @@ fn relink(build: &Path, out: &Path, windows: bool, module_dirs: &[String]) -> Re
     if !status.success() {
         return Err(Error::format(format!("the relinker failed ({status})")));
     }
+    #[cfg(unix)]
     if !windows {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&output, fs::Permissions::from_mode(0o755)).map_err(Error::io(format!("chmod {}", output.display())))?;
@@ -449,6 +466,15 @@ mod tests {
         assert_eq!(join_inside(base, "Media/level0").unwrap(), base.join("Media/level0"));
         for bad in ["../x", "/etc/passwd", "a/../../x", ""] {
             assert!(join_inside(base, bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn windows_device_names_and_trailing_dots_are_unsafe() {
+        assert!(is_windows_safe_path("Media/level0.assets"));
+        assert!(is_windows_safe_path("console/config.txt"));
+        for bad in ["CON", "data/nul.txt", "Aux", "com1.bin", "x.", "x ", "a?b"] {
+            assert!(!is_windows_safe_path(bad), "{bad:?}");
         }
     }
 

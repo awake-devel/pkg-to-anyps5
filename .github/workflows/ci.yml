@@ -9,17 +9,41 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: x86_64-pc-windows-msvc
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - run: cargo test
       - run: cargo build --release
+      - name: Smoke test
+        shell: bash
+        run: |
+          bin=target/release/pkg-to-anyps5
+          $bin --version
+          $bin --help > /dev/null
+          head -c 4096 /dev/urandom > junk.pkg
+          set +e
+          $bin junk.pkg out; status=$?
+          set -e
+          test "$status" -eq 2
+          test ! -e out
 
   msrv:
     runs-on: ubuntu-latest

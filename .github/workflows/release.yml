@@ -1,0 +1,70 @@
+name: Release
+
+# Push a tag such as v0.1.0 to build the binaries and publish a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Release binaries ship without debug info.
+  CARGO_PROFILE_RELEASE_DEBUG: "false"
+  CARGO_PROFILE_RELEASE_STRIP: "true"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, name: linux-x86_64 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, name: linux-aarch64 }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, name: windows-x86_64 }
+          - { os: macos-latest, target: aarch64-apple-darwin, name: macos-aarch64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo test --target ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          dir="pkg-to-anyps5-${GITHUB_REF_NAME}-${{ matrix.name }}"
+          mkdir "$dir"
+          cp README.md LICENSE "$dir/"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp "target/${{ matrix.target }}/release/pkg-to-anyps5.exe" "$dir/"
+            7z a "$dir.zip" "$dir" > /dev/null
+            echo "ASSET=$dir.zip" >> "$GITHUB_ENV"
+          else
+            cp "target/${{ matrix.target }}/release/pkg-to-anyps5" "$dir/"
+            tar czf "$dir.tar.gz" "$dir"
+            echo "ASSET=$dir.tar.gz" >> "$GITHUB_ENV"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ env.ASSET }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS.txt
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes

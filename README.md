@@ -9,7 +9,14 @@ stores them as fake-signed SELF files inside a compressed filesystem image, so
 this tool unpacks the image, unwraps every SELF into an ELF, and lays the
 files out for the relinker.
 
-## Build
+## Install
+
+Download a ready-made binary for Windows, Linux (x86_64, aarch64) or macOS
+(Apple silicon) from the
+[releases page](https://github.com/awake-devel/pkg-to-anyps5/releases), unpack
+it and run `pkg-to-anyps5` (`pkg-to-anyps5.exe` on Windows) from a terminal.
+
+Or build it with Rust 1.88 or newer:
 
 ```sh
 cargo install --git https://github.com/awake-devel/pkg-to-anyps5
@@ -17,8 +24,7 @@ cargo install --git https://github.com/awake-devel/pkg-to-anyps5
 cargo build --release   # binary at target/release/pkg-to-anyps5
 ```
 
-Needs Rust 1.88 or newer. No dependencies beyond the Rust standard library.
-Linux only (positional reads use `std::os::unix`). The
+No dependencies beyond the Rust standard library. The
 [wiki](https://github.com/awake-devel/pkg-to-anyps5/wiki) has a step-by-step
 guide.
 
@@ -42,7 +48,7 @@ pkg-to-anyps5 game.pkg out --relink ~/AnyPS5/build
 | `--executables-only` | Write `source/` only (seconds instead of a full copy). |
 | `--jobs <n>` | Files decoded at once (default 4). |
 | `--only <path>` | Write only the `app0/` files at or under a path (repeatable), to check a few files without copying a whole game. |
-| `--relink <build-dir>` | Afterwards run `<build-dir>/core/relinker/relinker` on `source/eboot.bin` to make `app.elf`, and copy AnyPS5's system libraries into `libs/`. |
+| `--relink <build-dir>` | Afterwards run `<build-dir>/core/relinker/relinker` (`relinker.exe` on Windows) on `source/eboot.bin` to make `app.elf`, and copy AnyPS5's system libraries into `libs/`. |
 | `--module-dir <dir>` | With `--relink`: also convert the modules of this package directory that the game loads at run time, such as Unity's `Media/Plugins` (needs a relinker with `--module-dir`). Repeatable. |
 | `--windows` | With `--relink`: produce `app.exe` for Windows instead. |
 | `-h`, `--help` / `-V`, `--version` | Print help or the version. |
