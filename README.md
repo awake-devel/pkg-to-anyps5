@@ -70,7 +70,7 @@ pkg-to-anyps5 game.pkg out --verbose
 | `-v`, `--verbose` | Show a live status line while converting: the phase, a progress bar, bytes done, speed, ETA and the file being written, ending with a one-line summary. Without a terminal, or with `NO_COLOR` set, it prints plain progress lines instead. |
 | `-h`, `--help` / `-V`, `--version` | Print help or the version. |
 
-Exit status is 0 on success, 1 for a usage error and 2 when the package
+Exit status is 0 on success, 1 for a usage error and 2 when the input
 cannot be read.
 
 The input can be either a debug `.pkg` or an existing game directory containing
@@ -112,11 +112,12 @@ packages pad the file-offset table to 16 bytes, others start the u2c table
 right after it. Both placements are tried, and only the one whose blocks cover
 the image exactly is used.
 
-Every inconsistency is an error. The tool never writes a partial or guessed
-file: a file being written when an error occurs is removed. Files finished
-before the error stay, so delete the output directory after a failed run. Package paths that
-could leave the output directory (`..`, absolute paths) are refused, and sizes
-read from headers are checked before anything is allocated.
+Every inconsistency is an error. The tool never leaves a partial file behind:
+failed writes are removed, and folder copies are written to a temporary file
+before being renamed into place. Files finished before an error stay, so delete
+the output directory after a failed run. Package paths that could leave the
+output directory (`..`, absolute paths) are refused, folder symlinks are skipped,
+and folder input/output directories may not overlap.
 
 ## Tested
 
