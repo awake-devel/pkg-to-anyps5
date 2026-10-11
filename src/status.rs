@@ -7,9 +7,10 @@
 //! Without `--verbose` every method prints exactly what the tool printed
 //! before the status line existed.
 
+use std::collections::HashSet;
 use std::fmt::{self, Write as _};
-use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
-use std::process::{Command, ExitStatus, Stdio};
+use std::io::{self, IsTerminal, Write};
+use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::thread::JoinHandle;
@@ -24,10 +25,21 @@ const PLAIN_INTERVAL: Duration = Duration::from_secs(5);
 /// Time constant of the smoothed throughput, in seconds.
 const SPEED_TAU: f64 = 1.5;
 
-/// Erases the current line and shows the cursor again.
-const RESTORE: &str = "\r\x1b[2K\x1b[?25h";
+/// Every frame starts by erasing from the start of the line to the end of
+/// the screen, and ends with a carriage return so the hidden cursor rests at
+/// the start of the line. If the terminal narrows and rewraps a long frame
+/// over several rows, the cursor stays on the first of them, so the next
+/// erase removes them all. Moving the cursor up instead would erase log
+/// lines on terminals that cut lines rather than rewrap them.
+const CLEAR: &str = "\r\x1b[J";
 const HIDE_CURSOR: &str = "\x1b[?25l";
-const CLEAR_LINE: &str = "\r\x1b[2K";
+/// Erases the line, resets colours and shows the cursor again.
+const RESTORE: &str = "\r\x1b[0m\x1b[J\x1b[?25h";
+/// What the signal handler writes. A frame is one `write` call, but a
+/// signal can still cut that call short in the middle of an escape
+/// sequence; CAN (0x18) aborts a sequence in progress and is ignored
+/// anywhere else, so what follows is read as fresh sequences.
+const SIGNAL_RESTORE: &str = "\x18\r\x1b[0m\x1b[J\x1b[?25h";
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 
@@ -109,20 +121,22 @@ struct Shared {
     steps: u8,
     started: Instant,
     stop: AtomicBool,
+    /// Set while a child process owns the terminal: no redraws.
+    suspended: AtomicBool,
     phase: AtomicU8,
     step: AtomicU8,
     /// Bumped on every phase change so the throughput meter starts over.
     generation: AtomicU64,
     phase_started_us: AtomicU64,
+    /// Time spent in the phases that move bytes, for the average speed.
+    moving_us: AtomicU64,
     done: AtomicU64,
     total: AtomicU64,
     files_done: AtomicU64,
     files_total: AtomicU64,
-    /// Over all phases, for the summary.
-    bytes_all: AtomicU64,
-    files_all: AtomicU64,
+    tally: Tally,
     file: Mutex<String>,
-    /// The frame on screen. Held while anything writes to the terminal, so a
+    /// The line on screen. Held while anything writes to the terminal, so a
     /// log line and a redraw never interleave.
     screen: Mutex<String>,
 }
@@ -140,16 +154,17 @@ impl Status {
             steps,
             started,
             stop: AtomicBool::new(false),
+            suspended: AtomicBool::new(false),
             phase: AtomicU8::new(Phase::Reading as u8),
             step: AtomicU8::new(0),
             generation: AtomicU64::new(0),
             phase_started_us: AtomicU64::new(0),
+            moving_us: AtomicU64::new(0),
             done: AtomicU64::new(0),
             total: AtomicU64::new(0),
             files_done: AtomicU64::new(0),
             files_total: AtomicU64::new(0),
-            bytes_all: AtomicU64::new(0),
-            files_all: AtomicU64::new(0),
+            tally: Tally::default(),
             file: Mutex::new(String::new()),
             screen: Mutex::new(String::new()),
         });
@@ -157,9 +172,11 @@ impl Status {
             Mode::Quiet => None,
             Mode::Plain | Mode::Live => {
                 if mode == Mode::Live {
+                    // The live line writes to fd 1 directly, past std's buffer.
+                    let _ = io::stdout().flush();
                     install_restore_hooks();
-                    LIVE.store(true, Ordering::SeqCst);
                     shared.write_raw(HIDE_CURSOR);
+                    LIVE.store(true, Ordering::SeqCst);
                 }
                 let shared = Arc::clone(&shared);
                 Some(std::thread::spawn(move || render_loop(&shared)))
@@ -174,19 +191,20 @@ impl Status {
 
     /// Prints a log line above the status line.
     pub fn line(&self, text: impl fmt::Display) {
-        self.shared.print(&text.to_string(), false);
+        self.shared.print(&text.to_string());
     }
 
     /// Starts the next phase with its byte and file totals (zero when it
     /// has none).
     pub fn phase(&self, phase: Phase, bytes: u64, files: u64) {
         let s = &self.shared;
+        s.close_phase();
         s.total.store(bytes, Ordering::Relaxed);
         s.done.store(0, Ordering::Relaxed);
         s.files_total.store(files, Ordering::Relaxed);
         s.files_done.store(0, Ordering::Relaxed);
         s.file.lock().unwrap().clear();
-        s.phase_started_us.store(s.started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        s.phase_started_us.store(s.now_us(), Ordering::Relaxed);
         s.phase.store(phase as u8, Ordering::Relaxed);
         let step = s.step.fetch_add(1, Ordering::Relaxed) + 1;
         s.generation.fetch_add(1, Ordering::Release);
@@ -195,7 +213,7 @@ impl Status {
             if files > 0 {
                 let _ = write!(line, ": {} files, {}", format_count(files), format_bytes(bytes));
             }
-            s.print(&line, false);
+            s.print(&line);
         }
     }
 
@@ -206,30 +224,49 @@ impl Status {
         file.push_str(name);
     }
 
+    /// Progress of the current phase.
     pub fn advance(&self, bytes: u64) {
         self.shared.done.fetch_add(bytes, Ordering::Relaxed);
-        self.shared.bytes_all.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// A file of the current phase is finished.
     pub fn file_done(&self) {
         self.shared.files_done.fetch_add(1, Ordering::Relaxed);
-        self.shared.files_all.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Runs a command to completion. Under the live line its output is read
-    /// through pipes and printed above the line instead of across it.
+    /// A package file was written, for the summary (see `Tally`).
+    pub fn wrote(&self, path: &str, size: u64) {
+        self.shared.tally.record(path, size);
+    }
+
+    /// Runs a command to completion with the terminal handed over to it:
+    /// the live line is erased and the cursor shown while it runs, and the
+    /// command writes to the inherited stdout and stderr exactly as without
+    /// `--verbose`. The line comes back afterwards.
     pub fn run(&self, command: &mut Command) -> io::Result<ExitStatus> {
         if self.shared.mode != Mode::Live {
             return command.status();
         }
-        let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-        let stdout = child.stdout.take().expect("piped");
-        let stderr = child.stderr.take().expect("piped");
-        std::thread::scope(|scope| {
-            scope.spawn(|| forward_lines(stdout, |line| self.shared.print(line, false)));
-            scope.spawn(|| forward_lines(stderr, |line| self.shared.print(line, true)));
-        });
-        child.wait()
+        {
+            let mut screen = self.shared.screen.lock().unwrap();
+            self.shared.suspended.store(true, Ordering::SeqCst);
+            // The signal handler has nothing to restore while the child
+            // has the terminal.
+            LIVE.store(false, Ordering::SeqCst);
+            screen.clear();
+            write_stdout(RESTORE);
+        }
+        let result = command.status();
+        {
+            let _screen = self.shared.screen.lock().unwrap();
+            write_stdout(HIDE_CURSOR);
+            LIVE.store(true, Ordering::SeqCst);
+            self.shared.suspended.store(false, Ordering::SeqCst);
+        }
+        if let Some(render) = &self.render {
+            render.thread().unpark();
+        }
+        result
     }
 
     /// Replaces the line with the summary. Without `--verbose` this is the
@@ -253,15 +290,18 @@ impl Status {
             render.thread().unpark();
             let _ = render.join();
         }
+        s.close_phase();
         let elapsed = s.started.elapsed();
+        let (bytes, files) = s.tally.totals();
         let summary = Summary {
             outcome,
             phase: s.current_phase(),
             done: s.done.load(Ordering::Relaxed),
             total: s.total.load(Ordering::Relaxed),
-            bytes: s.bytes_all.load(Ordering::Relaxed),
-            files: s.files_all.load(Ordering::Relaxed),
+            bytes,
+            files,
             elapsed,
+            moving: Duration::from_micros(s.moving_us.load(Ordering::Relaxed)),
         };
         match s.mode {
             Mode::Quiet => {
@@ -279,7 +319,7 @@ impl Status {
                 screen.clear();
                 let text = match outcome {
                     Outcome::Silent => RESTORE.to_owned(),
-                    _ => format!("{CLEAR_LINE}{}\n\x1b[?25h", render_summary(&summary, true)),
+                    _ => format!("{RESTORE}{}\n", render_summary(&summary, true)),
                 };
                 write_stdout(&text);
                 LIVE.store(false, Ordering::SeqCst);
@@ -301,22 +341,28 @@ impl Shared {
         Phase::ALL[self.phase.load(Ordering::Relaxed) as usize % Phase::ALL.len()]
     }
 
-    fn print(&self, text: &str, to_stderr: bool) {
+    fn now_us(&self) -> u64 {
+        self.started.elapsed().as_micros() as u64
+    }
+
+    /// Adds the time of the phase that is ending to `moving_us` if it moved
+    /// bytes.
+    fn close_phase(&self) {
+        if self.step.load(Ordering::Relaxed) > 0 && self.current_phase().determinate() {
+            let now = self.now_us();
+            let since = self.phase_started_us.swap(now, Ordering::Relaxed);
+            self.moving_us.fetch_add(now.saturating_sub(since), Ordering::Relaxed);
+        }
+    }
+
+    fn print(&self, text: &str) {
         if self.mode != Mode::Live {
-            match to_stderr {
-                false => println!("{text}"),
-                true => eprintln!("{text}"),
-            }
+            println!("{text}");
             return;
         }
         let screen = self.screen.lock().unwrap();
-        if to_stderr {
-            write_stdout(CLEAR_LINE);
-            eprintln!("{text}");
-            write_stdout(&screen);
-        } else {
-            write_stdout(&format!("{CLEAR_LINE}{text}\n{screen}"));
-        }
+        let redraw = if screen.is_empty() { String::new() } else { frame(&screen) };
+        write_stdout(&format!("{CLEAR}{text}\n{redraw}"));
     }
 
     fn write_raw(&self, text: &str) {
@@ -345,6 +391,38 @@ impl Shared {
     }
 }
 
+/// What the summary counts: every package file written, once, at its size
+/// in the package, however many outputs it went to. Files are keyed by
+/// their path relative to source/ or app0/, which is the package path: a
+/// game module outside sce_module/ is unwrapped into source/ and also
+/// copied into app0/ at the same relative path, and that is one file of
+/// work, not two. The CNT metadata in app0/sce_sys/ counts at its own size.
+/// So `files` is the number of distinct relative paths under source/ and
+/// app0/ once the run is done.
+#[derive(Default)]
+struct Tally {
+    seen: Mutex<HashSet<String>>,
+    bytes: AtomicU64,
+    files: AtomicU64,
+}
+
+impl Tally {
+    /// Counts `path` unless it was counted before; returns whether it was new.
+    fn record(&self, path: &str, size: u64) -> bool {
+        let new = self.seen.lock().unwrap().insert(path.to_owned());
+        if new {
+            self.bytes.fetch_add(size, Ordering::Relaxed);
+            self.files.fetch_add(1, Ordering::Relaxed);
+        }
+        new
+    }
+
+    /// Bytes and files counted.
+    fn totals(&self) -> (u64, u64) {
+        (self.bytes.load(Ordering::Relaxed), self.files.load(Ordering::Relaxed))
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Outcome {
     Done,
@@ -363,11 +441,13 @@ fn render_loop(shared: &Shared) {
             Mode::Live => {
                 let line = render_line(&view, terminal_width(), tick);
                 let mut screen = shared.screen.lock().unwrap();
-                write_stdout(&format!("{CLEAR_LINE}{line}"));
-                *screen = line;
+                if !shared.suspended.load(Ordering::SeqCst) {
+                    write_stdout(&frame(&line));
+                    *screen = line;
+                }
             }
             Mode::Plain if view.phase.determinate() && now.duration_since(last_plain) >= PLAIN_INTERVAL => {
-                shared.print(&render_plain(&view), false);
+                shared.print(&render_plain(&view));
                 last_plain = now;
             }
             _ => {}
@@ -377,19 +457,15 @@ fn render_loop(shared: &Shared) {
     }
 }
 
-fn write_stdout(text: &str) {
-    let mut out = io::stdout().lock();
-    let _ = out.write_all(text.as_bytes());
-    let _ = out.flush();
+/// The bytes that put `line` on screen (see `CLEAR`).
+fn frame(line: &str) -> String {
+    format!("{CLEAR}{line}\r")
 }
 
-fn forward_lines(reader: impl Read, mut emit: impl FnMut(&str)) {
-    let mut reader = BufReader::new(reader);
-    let mut line = Vec::new();
-    while matches!(reader.read_until(b'\n', &mut line), Ok(n) if n > 0) {
-        emit(String::from_utf8_lossy(&line).trim_end_matches(['\r', '\n']));
-        line.clear();
-    }
+/// One `write` call per frame where the platform allows, so a frame reaches
+/// the terminal whole as far as other writers can tell.
+fn write_stdout(text: &str) {
+    sys::write_stdout(text.as_bytes());
 }
 
 /// Smoothed throughput: an exponential moving average of the rate between
@@ -513,7 +589,7 @@ fn render_line(view: &View, cols: usize, tick: u64) -> String {
         fields.push(text(8, clock.len(), format!("{}{clock}{RESET}", fg(TEXT))));
     }
     let name: String = view.file.chars().map(|c| if c.is_control() { '?' } else { c }).collect();
-    let name_width = name.chars().count();
+    let name_width = str_width(&name);
     if name_width > 0 {
         fields.push(Field { priority: 3, width: name_width.min(FILE_MIN), content: Content::File(name) });
     }
@@ -629,6 +705,8 @@ struct Summary {
     bytes: u64,
     files: u64,
     elapsed: Duration,
+    /// Time in the phases that move bytes (unwrapping and copying).
+    moving: Duration,
 }
 
 fn render_summary(summary: &Summary, color: bool) -> String {
@@ -649,18 +727,28 @@ fn render_summary(summary: &Summary, color: bool) -> String {
             line + &dot + &paint(TEXT, false, &time)
         }
         _ => {
-            let speed = if secs > 0.0 { summary.bytes as f64 / secs } else { 0.0 };
             let mut line = format!("{} {}  ", paint(GOOD, true, "✓"), paint(GOOD, true, "done"));
             line += &paint(TEXT, true, &format_bytes(summary.bytes));
             line += &dot;
             line += &paint(TEXT, true, &format!("{} files", format_count(summary.files)));
             line += &dot;
             line += &paint(TEXT, true, &time);
-            line += &dot;
-            line += &paint(DIM, false, "avg ");
-            line + &paint(GRADIENT[0], true, &format_rate(speed))
+            if let Some(speed) = average_speed(summary.bytes, summary.moving) {
+                line += &dot;
+                line += &paint(DIM, false, "avg ");
+                line += &paint(GRADIENT[0], true, &format_rate(speed));
+            }
+            line
         }
     }
+}
+
+/// Bytes per second over the time spent moving bytes: reading the package
+/// and relinking take time that says nothing about the copy speed. None
+/// when nothing was moved.
+fn average_speed(bytes: u64, moving: Duration) -> Option<f64> {
+    let secs = moving.as_secs_f64();
+    (bytes > 0 && secs > 0.0).then(|| bytes as f64 / secs)
 }
 
 fn fg(c: Rgb) -> String {
@@ -765,18 +853,93 @@ fn format_count(n: u64) -> String {
     out
 }
 
-/// Keeps the end of a path, which names the file: "…/Media/level0".
+/// Columns a character takes in a terminal: 0 for controls, combining
+/// marks and other zero-width characters, 2 for East Asian wide and
+/// fullwidth characters and emoji, 1 otherwise. A compact subset of
+/// Unicode's East Asian Width and general categories, enough for file
+/// names.
+pub fn char_width(c: char) -> usize {
+    let c = c as u32;
+    const ZERO: [(u32, u32); 14] = [
+        (0x0000, 0x001F),
+        (0x007F, 0x009F),
+        (0x0300, 0x036F),
+        (0x0483, 0x0489),
+        (0x0591, 0x05BD),
+        (0x0610, 0x061A),
+        (0x064B, 0x065F),
+        (0x1AB0, 0x1AFF),
+        (0x1DC0, 0x1DFF),
+        (0x200B, 0x200F),
+        (0x202A, 0x202E),
+        (0x2060, 0x2064),
+        (0x20D0, 0x20FF),
+        (0xFE00, 0xFE0F),
+    ];
+    const ZERO_MORE: [(u32, u32); 3] = [(0xFE20, 0xFE2F), (0xFEFF, 0xFEFF), (0xE0000, 0xE01EF)];
+    const WIDE: [(u32, u32); 21] = [
+        (0x1100, 0x115F),
+        (0x231A, 0x231B),
+        (0x2329, 0x232A),
+        (0x23E9, 0x23EC),
+        (0x25FD, 0x25FE),
+        (0x2614, 0x2615),
+        (0x2E80, 0x303E),
+        (0x3041, 0x33FF),
+        (0x3400, 0x4DBF),
+        (0x4E00, 0x9FFF),
+        (0xA000, 0xA4CF),
+        (0xA960, 0xA97F),
+        (0xAC00, 0xD7A3),
+        (0xF900, 0xFAFF),
+        (0xFE30, 0xFE4F),
+        (0xFF00, 0xFF60),
+        (0xFFE0, 0xFFE6),
+        (0x1F300, 0x1F64F),
+        (0x1F680, 0x1F6FF),
+        (0x1F900, 0x1F9FF),
+        (0x20000, 0x3FFFD),
+    ];
+    let within = |ranges: &[(u32, u32)]| ranges.iter().any(|&(lo, hi)| (lo..=hi).contains(&c));
+    if within(&ZERO) || within(&ZERO_MORE) {
+        0
+    } else if within(&WIDE) {
+        2
+    } else {
+        1
+    }
+}
+
+/// Columns `text` takes in a terminal.
+pub fn str_width(text: &str) -> usize {
+    text.chars().map(char_width).sum()
+}
+
+/// Keeps the end of a path, which names the file: "…/Media/level0". The
+/// result is at most `max` columns wide; a wide character that would
+/// straddle the limit is left out whole.
 fn truncate_left(text: &str, max: usize) -> String {
-    let count = text.chars().count();
-    if count <= max {
+    if str_width(text) <= max {
         return text.to_owned();
     }
     if max == 0 {
         return String::new();
     }
-    let mut out = String::from("…");
-    out.extend(text.chars().skip(count - (max - 1)));
-    out
+    let mut kept = Vec::new();
+    let mut width = 1; // the ellipsis
+    for c in text.chars().rev() {
+        let w = char_width(c);
+        if width + w > max {
+            break;
+        }
+        width += w;
+        kept.push(c);
+    }
+    // A combining mark cut from its base would land on the ellipsis.
+    while kept.last().is_some_and(|&c| char_width(c) == 0) {
+        kept.pop();
+    }
+    std::iter::once('…').chain(kept.into_iter().rev()).collect()
 }
 
 /// The live line needs a terminal that takes escape codes, and a user who
@@ -800,8 +963,8 @@ fn install_restore_hooks() {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             if LIVE.load(Ordering::SeqCst) {
-                let _ = io::stdout().write_all(format!("{RESTORE}\n").as_bytes());
-                let _ = io::stdout().flush();
+                // The render thread may be in the middle of a frame.
+                sys::write_stdout(format!("{SIGNAL_RESTORE}\n").as_bytes());
             }
             previous(info);
         }));
@@ -813,7 +976,7 @@ fn install_restore_hooks() {
 mod sys {
     use std::ffi::{c_int, c_ulong, c_void};
 
-    use super::{LIVE, RESTORE};
+    use super::{LIVE, SIGNAL_RESTORE};
 
     #[repr(C)]
     struct Winsize {
@@ -863,6 +1026,8 @@ mod sys {
     const SIGINT: c_int = 2;
     const SIGTERM: c_int = 15;
     const SIG_DFL: usize = 0;
+    const SIG_IGN: usize = 1;
+    const EINTR: i32 = 4;
 
     // The C library std already links against; no crate needed.
     unsafe extern "C" {
@@ -874,6 +1039,20 @@ mod sys {
 
     pub fn enable_escapes() -> bool {
         true
+    }
+
+    /// Writes all of `bytes` to fd 1, in one call unless the terminal takes
+    /// less.
+    pub fn write_stdout(mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            // SAFETY: writes from a live slice.
+            let n = unsafe { write(1, bytes.as_ptr().cast(), bytes.len()) };
+            match n {
+                n if n > 0 => bytes = &bytes[n as usize..],
+                n if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(EINTR) => {}
+                _ => return,
+            }
+        }
     }
 
     pub fn width() -> Option<usize> {
@@ -889,7 +1068,7 @@ mod sys {
         extern "C" fn handler(signum: c_int) {
             if LIVE.load(std::sync::atomic::Ordering::SeqCst) {
                 // SAFETY: write, signal and raise are async-signal-safe.
-                unsafe { write(1, RESTORE.as_ptr().cast(), RESTORE.len()) };
+                unsafe { write(1, SIGNAL_RESTORE.as_ptr().cast(), SIGNAL_RESTORE.len()) };
             }
             unsafe {
                 signal(signum, SIG_DFL);
@@ -898,7 +1077,13 @@ mod sys {
         }
         for signum in [SIGHUP, SIGINT, SIGTERM] {
             // SAFETY: the handler only calls async-signal-safe functions.
-            unsafe { signal(signum, handler as extern "C" fn(c_int) as usize) };
+            // A signal the parent ignores (nohup, a background job) stays
+            // ignored.
+            unsafe {
+                if signal(signum, handler as extern "C" fn(c_int) as usize) == SIG_IGN {
+                    signal(signum, SIG_IGN);
+                }
+            }
         }
     }
 }
@@ -908,7 +1093,7 @@ mod sys {
     use std::ffi::c_void;
     use std::io::Write;
 
-    use super::{LIVE, RESTORE};
+    use super::{LIVE, SIGNAL_RESTORE};
 
     type Handle = *mut c_void;
 
@@ -961,6 +1146,13 @@ mod sys {
         }
     }
 
+    /// The console takes a whole buffer per call through std's stdout.
+    pub fn write_stdout(bytes: &[u8]) {
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(bytes);
+        let _ = out.flush();
+    }
+
     pub fn width() -> Option<usize> {
         let mut info = ScreenBufferInfo::default();
         // SAFETY: the call fills one CONSOLE_SCREEN_BUFFER_INFO.
@@ -974,8 +1166,7 @@ mod sys {
     pub fn on_interrupt() {
         unsafe extern "system" fn handler(_event: u32) -> i32 {
             if LIVE.load(std::sync::atomic::Ordering::SeqCst) {
-                let _ = std::io::stdout().write_all(RESTORE.as_bytes());
-                let _ = std::io::stdout().flush();
+                write_stdout(SIGNAL_RESTORE.as_bytes());
             }
             0
         }
@@ -986,8 +1177,16 @@ mod sys {
 
 #[cfg(not(any(unix, windows)))]
 mod sys {
+    use std::io::Write;
+
     pub fn enable_escapes() -> bool {
         true
+    }
+
+    pub fn write_stdout(bytes: &[u8]) {
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(bytes);
+        let _ = out.flush();
     }
 
     pub fn width() -> Option<usize> {
@@ -998,7 +1197,9 @@ mod sys {
 }
 
 /// `--status-demo`: drives the status line through a simulated conversion,
-/// to see or record it without a package.
+/// to see or record it without a package. With PKG_TO_ANYPS5_DEMO_RELINKER
+/// set to a program, the relinking phase runs it the way the real relink
+/// does.
 pub fn demo() {
     use std::sync::atomic::AtomicUsize;
     use std::thread::sleep;
@@ -1029,6 +1230,7 @@ pub fn demo() {
         sleep(Duration::from_millis(80 + size / MIB * 6));
         status.advance(size);
         status.file_done();
+        status.wrote(path, size);
         status.line(format!("  source/{path:<40} ELF type 0xfe18, {size} bytes"));
     }
 
@@ -1037,6 +1239,9 @@ pub fn demo() {
     files.push(("Media/sharedassets0.assets.resS".to_owned(), 520 * MIB));
     files.push(("Media/resources.assets".to_owned(), 310 * MIB));
     files.push(("Media/level0".to_owned(), 180 * MIB));
+    files.push(("Media/ローカライズ/日本語テキスト.bundle".to_owned(), 24 * MIB));
+    // Also unwrapped above: counted once in the summary.
+    files.push(("Media/Modules/GameAssembly.prx".to_owned(), 92 * MIB));
     files.sort_by_key(|f| std::cmp::Reverse(f.1));
     let total: u64 = files.iter().map(|f| f.1).sum();
     status.phase(Phase::Copying, total, files.len() as u64);
@@ -1058,6 +1263,7 @@ pub fn demo() {
                         n += 1;
                     }
                     status.file_done();
+                    status.wrote(path, *size);
                 }
             });
         }
@@ -1066,8 +1272,21 @@ pub fn demo() {
 
     status.phase(Phase::Relinking, 0, 0);
     status.set_file("source/eboot.bin → app.elf");
-    status.line("relink      ~/AnyPS5/build/core/relinker/relinker");
-    sleep(Duration::from_millis(1400));
+    match std::env::var_os("PKG_TO_ANYPS5_DEMO_RELINKER") {
+        Some(relinker) => {
+            status.line(format!("relink      {}", relinker.to_string_lossy()));
+            match status.run(&mut Command::new(&relinker)) {
+                Ok(exit) => status.line(format!("  relinker exited ({exit})")),
+                Err(err) => status.line(format!("  relinker did not run: {err}")),
+            }
+            // Long enough to see the line come back.
+            sleep(Duration::from_millis(500));
+        }
+        None => {
+            status.line("relink      ~/AnyPS5/build/core/relinker/relinker");
+            sleep(Duration::from_millis(1400));
+        }
+    }
     status.line("  out/app.elf and libs/ (41 system libraries) are ready");
     status.finish();
 }
@@ -1177,7 +1396,7 @@ mod tests {
         for cols in [10, 20, 40, 60, 80, 100, 120, 160, 300] {
             for view in [copying(3 << 30, 8 << 30), View { phase: Phase::Reading, ..copying(0, 0) }] {
                 let line = visible(&render_line(&view, cols, 5));
-                assert!(line.chars().count() < cols, "{cols}: {line:?}");
+                assert!(str_width(&line) < cols, "{cols}: {line:?}");
             }
         }
     }
@@ -1203,10 +1422,171 @@ mod tests {
             bytes: 8_300_000_000,
             files: 2150,
             elapsed: Duration::from_millis(24_100),
+            moving: Duration::from_secs(20),
         };
-        assert_eq!(render_summary(&summary, false), "✓ done  7.73 GiB · 2,150 files · 24.1 s · avg 328 MiB/s");
+        // The average is over the 20 s of copying, not the 24.1 s run.
+        assert_eq!(render_summary(&summary, false), "✓ done  7.73 GiB · 2,150 files · 24.1 s · avg 396 MiB/s");
         assert_eq!(visible(&render_summary(&summary, true)), render_summary(&summary, false));
+        let nothing_moved = Summary { moving: Duration::ZERO, ..summary };
+        assert_eq!(render_summary(&nothing_moved, false), "✓ done  7.73 GiB · 2,150 files · 24.1 s");
+        let long = Summary { elapsed: Duration::from_secs(125), ..summary };
+        assert!(render_summary(&long, false).contains(" · 2:05 · "));
         let failed = Summary { outcome: Outcome::Failed, done: 3 << 30, total: 8 << 30, ..summary };
         assert_eq!(render_summary(&failed, false), "✗ stopped while copying app0 · 3.00/8.00 GiB · 24.1 s");
+        let failed_reading = Summary { outcome: Outcome::Failed, phase: Phase::Reading, ..summary };
+        assert_eq!(render_summary(&failed_reading, false), "✗ stopped while reading package · 24.1 s");
+    }
+
+    #[test]
+    fn the_average_speed_counts_only_time_moving_bytes() {
+        assert_eq!(average_speed(1 << 30, Duration::from_secs(2)), Some(512.0 * 1048576.0));
+        assert_eq!(average_speed(0, Duration::from_secs(2)), None);
+        assert_eq!(average_speed(1 << 30, Duration::ZERO), None);
+    }
+
+    #[test]
+    fn character_widths() {
+        for (c, width) in [
+            ('a', 1),
+            ('é', 1),
+            ('…', 1),
+            ('█', 1),
+            ('▏', 1),
+            ('⠋', 1),
+            ('→', 1),
+            ('日', 2),
+            ('語', 2),
+            ('ア', 2),
+            ('ぁ', 2),
+            ('한', 2),
+            ('Ａ', 2),
+            ('😀', 2),
+            ('🚀', 2),
+            ('🦀', 2),
+            ('\u{20000}', 2),
+            ('\u{0301}', 0),
+            ('\u{200B}', 0),
+            ('\u{200D}', 0),
+            ('\u{FE0F}', 0),
+            ('\u{FEFF}', 0),
+            ('\x07', 0),
+            ('\x1b', 0),
+            ('\u{85}', 0),
+        ] {
+            assert_eq!(char_width(c), width, "{c:?}");
+        }
+        assert_eq!(str_width("Media/level0"), 12);
+        assert_eq!(str_width("日本語.bundle"), 13);
+        assert_eq!(str_width("e\u{301}"), 1);
+        assert_eq!(str_width(""), 0);
+    }
+
+    #[test]
+    fn truncation_counts_columns_not_characters() {
+        let name = "Media/ローカライズ/日本語テキスト.bundle";
+        for max in 0..=str_width(name) + 2 {
+            let cut = truncate_left(name, max);
+            assert!(str_width(&cut) <= max, "{max}: {cut:?}");
+            // Only a wide character that would straddle the limit costs a column.
+            if max > 0 && max < str_width(name) {
+                assert!(str_width(&cut) >= max - 1, "{max}: {cut:?}");
+                assert!(cut.starts_with('…'));
+                assert!(name.ends_with(&cut['…'.len_utf8()..]));
+            }
+        }
+        assert_eq!(truncate_left("日本語", 4), "…語");
+        assert_eq!(truncate_left("日本語", 5), "…本語");
+        assert_eq!(truncate_left("日本語", 6), "日本語");
+        // A combining mark is never kept without its base.
+        assert_eq!(truncate_left("ae\u{301}x", 2), "…x");
+        assert_eq!(truncate_left("abce\u{301}", 3), "…ce\u{301}");
+    }
+
+    #[test]
+    fn the_tally_counts_each_package_file_once() {
+        let tally = Tally::default();
+        assert!(tally.record("eboot.bin", 100));
+        // Unwrapped into source/ and then copied into app0/.
+        assert!(tally.record("Media/Modules/GameAssembly.prx", 40));
+        assert!(!tally.record("Media/Modules/GameAssembly.prx", 40));
+        assert!(tally.record("Media/level0", 1000));
+        assert_eq!(tally.totals(), (1140, 3));
+    }
+
+    #[test]
+    fn the_tally_is_shared_by_the_copy_threads() {
+        let tally = Tally::default();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for i in 0..500 {
+                        tally.record(&format!("file{i}"), 2);
+                    }
+                });
+            }
+        });
+        assert_eq!(tally.totals(), (1000, 500));
+    }
+
+    #[test]
+    fn only_the_byte_moving_phases_count_towards_the_average() {
+        let status = Status::new(false, 4, Instant::now());
+        status.phase(Phase::Reading, 0, 0);
+        std::thread::sleep(Duration::from_millis(60));
+        status.phase(Phase::Copying, 10, 1);
+        std::thread::sleep(Duration::from_millis(60));
+        status.phase(Phase::Relinking, 0, 0);
+        std::thread::sleep(Duration::from_millis(120));
+        status.shared.close_phase();
+        let moving = Duration::from_micros(status.shared.moving_us.load(Ordering::Relaxed));
+        assert!(moving >= Duration::from_millis(60) && moving < Duration::from_millis(170), "{moving:?}");
+        status.close();
+    }
+
+    #[test]
+    fn the_status_counts_what_main_reports() {
+        let status = Status::new(false, 3, Instant::now());
+        status.phase(Phase::Unwrapping, 30, 2);
+        status.advance(10);
+        status.file_done();
+        status.wrote("eboot.bin", 10);
+        status.advance(20);
+        status.file_done();
+        status.wrote("Media/Modules/a.prx", 20);
+        assert_eq!(status.shared.done.load(Ordering::Relaxed), 30);
+        assert_eq!(status.shared.files_done.load(Ordering::Relaxed), 2);
+        status.phase(Phase::Copying, 520, 2);
+        assert_eq!(status.shared.done.load(Ordering::Relaxed), 0);
+        status.advance(20);
+        status.file_done();
+        status.wrote("Media/Modules/a.prx", 20);
+        status.advance(500);
+        status.file_done();
+        status.wrote("Media/level0", 500);
+        assert_eq!(status.shared.tally.totals(), (530, 3));
+        status.close();
+    }
+
+    #[test]
+    fn frames_leave_the_cursor_at_the_start_of_the_line() {
+        let framed = frame(" x");
+        assert!(framed.starts_with("\r\x1b[J"), "{framed:?}");
+        assert!(framed.ends_with('\r') && !framed.contains('\n'), "{framed:?}");
+        // Interrupted mid-sequence: CAN first, then reset, erase, cursor.
+        assert!(SIGNAL_RESTORE.starts_with('\x18'));
+        for part in ["\x1b[0m", "\x1b[J", "\x1b[?25h"] {
+            assert!(SIGNAL_RESTORE.contains(part) && RESTORE.contains(part), "{part:?}");
+        }
+    }
+
+    #[test]
+    fn wide_file_names_still_fit() {
+        let view = View { file: "Media/ローカライズ/日本語テキスト_🚀.bundle".to_owned(), ..copying(3 << 30, 8 << 30) };
+        for cols in 10..200 {
+            let line = visible(&render_line(&view, cols, 3));
+            assert!(str_width(&line) < cols, "{cols}: {line:?}");
+        }
+        let wide = visible(&render_line(&view, 200, 3));
+        assert!(wide.contains("日本語テキスト_🚀.bundle"), "{wide:?}");
     }
 }

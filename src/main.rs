@@ -103,7 +103,7 @@ fn parse_args() -> std::result::Result<Parsed, String> {
             Some("--windows") => options.windows = true,
             Some("-v" | "--verbose") => options.verbose = true,
             // Not in the help: runs the status line on simulated progress.
-            Some("--status-demo") => return Ok(Parsed::StatusDemo),
+            Some("--status-demo") if std::env::args_os().len() == 2 => return Ok(Parsed::StatusDemo),
             Some("--jobs") => {
                 let n = args.next().ok_or("--jobs needs a number")?;
                 options.jobs = n.to_str().and_then(|n| n.parse().ok()).filter(|&n| n > 0).ok_or("--jobs needs a positive number")?;
@@ -279,6 +279,7 @@ fn run(options: &Options) -> Result<()> {
             }
         };
         write_file(&join_inside(&source_dir, &file.path)?, &elf)?;
+        status.wrote(&file.path, file.size);
         status.line(format!("  source/{:<40} ELF type {:#06x}, {} bytes", file.path, selfelf::elf_type(&elf).unwrap_or(0), elf.len()));
     }
 
@@ -294,6 +295,11 @@ fn run(options: &Options) -> Result<()> {
         ));
         status.phase(Phase::Copying, resources.iter().map(|f| f.size).sum(), resources.len() as u64);
         let written = copy_resources(&image, &resources, &app0, options.jobs, started, &status)?;
+        // Counted after the copy: a package file at the same path replaced
+        // the CNT copy on disk, and the summary counts each path once.
+        for cnt_file in &cnt.files {
+            status.wrote(&format!("sce_sys/{}", cnt_file.name), cnt_file.bytes.len() as u64);
+        }
         status.line(format!("  app0/  {} files, {:.2} GiB", resources.len(), gib(written)));
     }
 
@@ -337,7 +343,10 @@ fn copy_resources(image: &InnerImage, files: &[&InnerFile], app0: &Path, jobs: u
                         }
                     });
                     match result {
-                        Ok(()) => status.file_done(),
+                        Ok(()) => {
+                            status.file_done();
+                            status.wrote(&file.path, file.size);
+                        }
                         Err(err) => {
                             failed.store(true, Ordering::Relaxed);
                             first_error.lock().unwrap().get_or_insert(err);
