@@ -77,7 +77,8 @@ fn errors_without_verbose_print_what_they_always_did() {
     let wrong = dir.join("wrong.bin");
     fs::write(&wrong, [b'A'; 512]).unwrap();
     for (package, expected) in [
-        (&missing, format!("error: open {}: No such file or directory (os error 2)\n", missing.display())),
+        // The OS words "not found" its own way (Windows differs from unix).
+        (&missing, format!("error: open {}: {}\n", missing.display(), fs::File::open(&missing).unwrap_err())),
         (&short, "error: invalid package: read of 0x100 bytes at 0x0 is past the end of the 0x1a-byte package\n".to_owned()),
         (&wrong, "error: invalid package: not a PS5 package: magic [41, 41, 41, 41]\n".to_owned()),
     ] {

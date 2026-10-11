@@ -1239,12 +1239,14 @@ pub fn demo() {
     files.push(("Media/sharedassets0.assets.resS".to_owned(), 520 * MIB));
     files.push(("Media/resources.assets".to_owned(), 310 * MIB));
     files.push(("Media/level0".to_owned(), 180 * MIB));
-    files.push(("Media/ローカライズ/日本語テキスト.bundle".to_owned(), 24 * MIB));
     // Also unwrapped above: counted once in the summary.
     files.push(("Media/Modules/GameAssembly.prx".to_owned(), 92 * MIB));
     files.sort_by_key(|f| std::cmp::Reverse(f.1));
-    let total: u64 = files.iter().map(|f| f.1).sum();
-    status.phase(Phase::Copying, total, files.len() as u64);
+    // Copied last on its own and slowly, so a wide name is always on screen
+    // for a few frames, however the copy threads are scheduled.
+    let (wide, wide_size) = ("Media/ローカライズ/日本語テキスト.bundle", 24 * MIB);
+    let total: u64 = files.iter().map(|f| f.1).sum::<u64>() + wide_size;
+    status.phase(Phase::Copying, total, files.len() as u64 + 1);
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for job in 0..4u64 {
@@ -1268,7 +1270,14 @@ pub fn demo() {
             });
         }
     });
-    status.line(format!("  app0/  {} files, {:.2} GiB", files.len(), total as f64 / (1u64 << 30) as f64));
+    status.set_file(wide);
+    for _ in 0..wide_size / (MIB / 4) {
+        sleep(Duration::from_millis(5));
+        status.advance(MIB / 4);
+    }
+    status.file_done();
+    status.wrote(wide, wide_size);
+    status.line(format!("  app0/  {} files, {:.2} GiB", files.len() + 1, total as f64 / (1u64 << 30) as f64));
 
     status.phase(Phase::Relinking, 0, 0);
     status.set_file("source/eboot.bin → app.elf");
