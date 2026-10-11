@@ -46,10 +46,13 @@ options:
   --relink <build-dir> afterwards run <build-dir>/core/relinker/relinker on
                        source/eboot.bin to make <output-dir>/app.elf, and copy
                        <build-dir>/core/libs/libs/*.prx into <output-dir>/libs/
+                       DEPRECATED: no longer maintained, removed in v1
   --module-dir <dir>   with --relink: also convert the modules of this package
                        directory that the game loads at run time, such as Unity's
                        Media/Plugins (needs a relinker with --module-dir, AnyPS5 #846)
+                       DEPRECATED with --relink, removed in v1
   --windows            with --relink: produce app.exe for Windows instead
+                       DEPRECATED with --relink, removed in v1
   -v, --verbose        show a live status line: phase, progress bar, speed,
                        ETA and the current file (plain lines without a terminal)
   -h, --help           print this help
@@ -60,6 +63,10 @@ const MAX_NAPS_SIZE: u64 = 1 << 30;
 
 /// Executables are unwrapped in memory; anything larger is a corrupt size.
 const MAX_EXECUTABLE_SIZE: u64 = 2 << 30;
+
+/// Printed whenever --relink is used, until the option is removed in v1.
+const RELINK_DEPRECATED: &str = "warning: --relink (with --module-dir and --windows) is no longer maintained \
+and will be removed in v1; run the AnyPS5 relinker on <output-dir>/source/eboot.bin yourself";
 
 enum Parsed {
     Run(Options),
@@ -167,6 +174,10 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // On stderr, so stdout (and anything parsing it) is unchanged.
+    if options.relink.is_some() {
+        eprintln!("{RELINK_DEPRECATED}");
+    }
     match run(&options) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {

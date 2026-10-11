@@ -37,14 +37,20 @@ guide.
 # What is in the package
 pkg-to-anyps5 game.pkg --list
 
-# Executables only (seconds), then relink with an AnyPS5 build
-pkg-to-anyps5 game.pkg out --executables-only --relink ~/AnyPS5/build
+# Executables only (seconds)
+pkg-to-anyps5 game.pkg out --executables-only
 
-# Everything: executables, every game file, relinked and ready to run,
-# with a live progress line
-pkg-to-anyps5 game.pkg out --relink ~/AnyPS5/build --verbose
-./out/app.elf
+# Everything: executables and every game file, with a live progress line
+pkg-to-anyps5 game.pkg out --verbose
+
+# Then run the AnyPS5 relinker on the result
+~/AnyPS5/build/core/relinker/relinker out/source/eboot.bin out/app.elf
 ```
+
+> **Deprecated:** `--relink`, and `--module-dir` and `--windows` with it, are
+> no longer maintained and will be removed in v1. They still work for now and
+> print a warning. Run the AnyPS5 relinker yourself on
+> `<output-dir>/source/eboot.bin` instead.
 
 | Option | Effect |
 |---|---|
@@ -52,9 +58,9 @@ pkg-to-anyps5 game.pkg out --relink ~/AnyPS5/build --verbose
 | `--executables-only` | Write `source/` only (seconds instead of a full copy). |
 | `--jobs <n>` | Files decoded at once (default 4). |
 | `--only <path>` | Write only the `app0/` files at or under a path (repeatable), to check a few files without copying a whole game. |
-| `--relink <build-dir>` | Afterwards run `<build-dir>/core/relinker/relinker` (`relinker.exe` on Windows) on `source/eboot.bin` to make `app.elf`, and copy AnyPS5's system libraries into `libs/`. |
-| `--module-dir <dir>` | With `--relink`: also convert the modules of this package directory that the game loads at run time, such as Unity's `Media/Plugins` (needs a relinker with `--module-dir`). Repeatable. |
-| `--windows` | With `--relink`: produce `app.exe` for Windows instead. |
+| `--relink <build-dir>` | **Deprecated, removed in v1.** Afterwards run `<build-dir>/core/relinker/relinker` (`relinker.exe` on Windows) on `source/eboot.bin` to make `app.elf`, and copy AnyPS5's system libraries into `libs/`. |
+| `--module-dir <dir>` | **Deprecated with `--relink`.** With `--relink`: also convert the modules of this package directory that the game loads at run time, such as Unity's `Media/Plugins` (needs a relinker with `--module-dir`). Repeatable. |
+| `--windows` | **Deprecated with `--relink`.** With `--relink`: produce `app.exe` for Windows instead. |
 | `-v`, `--verbose` | Show a live status line while converting: the phase, a progress bar, bytes done, speed, ETA and the file being written, ending with a one-line summary. Without a terminal, or with `NO_COLOR` set, it prints plain progress lines instead. |
 | `-h`, `--help` / `-V`, `--version` | Print help or the version. |
 

@@ -40,6 +40,27 @@ fn help_lists_the_verbose_flag() {
 }
 
 #[test]
+fn relink_is_marked_deprecated() {
+    let help = text(&run(&["--help"]).stdout);
+    assert_eq!(help.matches("removed in v1").count(), 3, "--relink, --module-dir and --windows: {help}");
+
+    let dir = scratch("relink");
+    let missing = dir.join("missing.pkg");
+    let out = run(&[missing.to_str().unwrap(), dir.join("out").to_str().unwrap(), "--relink", dir.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = text(&out.stderr);
+    let (warning, error) = stderr.split_once('\n').unwrap();
+    assert!(warning.starts_with("warning: --relink") && warning.contains("removed in v1"), "{stderr}");
+    assert!(error.starts_with("error: open "), "the run still goes ahead: {stderr}");
+    assert!(out.stdout.is_empty(), "the warning stays off stdout");
+
+    // No warning without --relink.
+    let plain = run(&[missing.to_str().unwrap(), dir.join("out").to_str().unwrap()]);
+    assert!(!text(&plain.stderr).contains("warning"));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn version() {
     let out = run(&["--version"]);
     assert!(out.status.success());
