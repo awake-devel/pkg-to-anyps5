@@ -112,8 +112,8 @@ read from headers are checked before anything is allocated.
 
 | Package | Result |
 |---|---|
-| Large package: 93 GB, 172 files, 134 GiB unpacked, 450,700 Kraken blocks | Tree listed, executables relinked; sample files decoded with correct signatures (Bink videos, SELF, a 2 GB data archive). Full copy not run. |
-| Unity package: 2.4 GB, 2,144 files, 7.7 GiB unpacked, one sparse block | Full extraction and relink in 24 s; seven guest modules built. |
+| Large package: 93 GB, 172 files, 134 GiB unpacked, 450,700 Kraken blocks | Full extraction in 10 min 39 s with the default 4 jobs (avg 216 MiB/s, peak memory 345 MiB). All 172 files present at their listed sizes, all 90 movies with valid Bink headers, executables relinked. |
+| Unity package: 2.4 GB, 2,144 files, 7.7 GiB unpacked, one sparse block | Full extraction in about 7 s (avg 1.1 GiB/s); with relink 24 s, seven guest modules built. |
 
 How far a game runs is up to AnyPS5. Both packages stop at load time on a
 system function it does not implement yet.
@@ -123,8 +123,10 @@ system function it does not implement yet.
 - Kraken entropy types 1 (tANS), 3 (RLE) and 5 (recursive) are not
   implemented; a block using them is reported, not guessed.
 - Inner images in a layout other than the flat mode 0x10 are refused.
-- Each file is decoded on one thread, at about 55 MB/s; `--jobs` decodes
-  several files at once.
+- Each Kraken-compressed file is decoded on one thread, at about 55 MB/s;
+  `--jobs` decodes several files at once. Stored files copy at disk speed.
+- A full extraction needs as much free space as the unpacked game (check with
+  `--list` first); the 93 GB package above needs 135 GiB.
 - Modules a game loads at runtime without importing them (Unity's
   `Media/Plugins/*.prx`) are unwrapped into `source/`, but the relinker only
   converts them when asked with `--module-dir`.
