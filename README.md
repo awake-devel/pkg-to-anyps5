@@ -40,8 +40,9 @@ pkg-to-anyps5 game.pkg --list
 # Executables only (seconds), then relink with an AnyPS5 build
 pkg-to-anyps5 game.pkg out --executables-only --relink ~/AnyPS5/build
 
-# Everything: executables, every game file, relinked and ready to run
-pkg-to-anyps5 game.pkg out --relink ~/AnyPS5/build
+# Everything: executables, every game file, relinked and ready to run,
+# with a live progress line
+pkg-to-anyps5 game.pkg out --relink ~/AnyPS5/build --verbose
 ./out/app.elf
 ```
 
@@ -54,6 +55,7 @@ pkg-to-anyps5 game.pkg out --relink ~/AnyPS5/build
 | `--relink <build-dir>` | Afterwards run `<build-dir>/core/relinker/relinker` (`relinker.exe` on Windows) on `source/eboot.bin` to make `app.elf`, and copy AnyPS5's system libraries into `libs/`. |
 | `--module-dir <dir>` | With `--relink`: also convert the modules of this package directory that the game loads at run time, such as Unity's `Media/Plugins` (needs a relinker with `--module-dir`). Repeatable. |
 | `--windows` | With `--relink`: produce `app.exe` for Windows instead. |
+| `-v`, `--verbose` | Show a live status line while converting: the phase, a progress bar, bytes done, speed, ETA and the file being written, ending with a one-line summary. Without a terminal, or with `NO_COLOR` set, it prints plain progress lines instead. |
 | `-h`, `--help` / `-V`, `--version` | Print help or the version. |
 
 Exit status is 0 on success, 1 for a usage error and 2 when the package

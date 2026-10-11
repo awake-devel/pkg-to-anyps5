@@ -10,6 +10,7 @@ mod naps;
 mod pfs;
 mod selfelf;
 mod source;
+mod status;
 
 use std::fs;
 use std::io::{BufWriter, Write};
@@ -24,6 +25,7 @@ use fih::{Cnt, Fih};
 use inner::{InnerFile, InnerImage};
 use pfs::OuterPfs;
 use source::Source;
+use status::{Phase, Status};
 
 const USAGE: &str = "\
 usage: pkg-to-anyps5 <package.pkg> <output-dir> [options]
@@ -48,6 +50,8 @@ options:
                        directory that the game loads at run time, such as Unity's
                        Media/Plugins (needs a relinker with --module-dir, AnyPS5 #846)
   --windows            with --relink: produce app.exe for Windows instead
+  -v, --verbose        show a live status line: phase, progress bar, speed,
+                       ETA and the current file (plain lines without a terminal)
   -h, --help           print this help
   -V, --version        print the version";
 
@@ -61,6 +65,7 @@ enum Parsed {
     Run(Options),
     Help,
     Version,
+    StatusDemo,
 }
 
 struct Options {
@@ -73,6 +78,7 @@ struct Options {
     only: Vec<String>,
     module_dirs: Vec<String>,
     jobs: usize,
+    verbose: bool,
 }
 
 fn parse_args() -> std::result::Result<Parsed, String> {
@@ -88,12 +94,16 @@ fn parse_args() -> std::result::Result<Parsed, String> {
         only: Vec::new(),
         module_dirs: Vec::new(),
         jobs: 4,
+        verbose: false,
     };
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--list") => options.list = true,
             Some("--executables-only") => options.executables_only = true,
             Some("--windows") => options.windows = true,
+            Some("-v" | "--verbose") => options.verbose = true,
+            // Not in the help: runs the status line on simulated progress.
+            Some("--status-demo") => return Ok(Parsed::StatusDemo),
             Some("--jobs") => {
                 let n = args.next().ok_or("--jobs needs a number")?;
                 options.jobs = n.to_str().and_then(|n| n.parse().ok()).filter(|&n| n > 0).ok_or("--jobs needs a positive number")?;
@@ -148,6 +158,10 @@ fn main() -> ExitCode {
             println!("pkg-to-anyps5 {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
+        Ok(Parsed::StatusDemo) => {
+            status::demo();
+            return ExitCode::SUCCESS;
+        }
         Err(message) => {
             eprintln!("error: {message}\n\n{USAGE}");
             return ExitCode::from(1);
@@ -164,20 +178,24 @@ fn main() -> ExitCode {
 
 fn run(options: &Options) -> Result<()> {
     let started = Instant::now();
+    let steps = 2 + u8::from(!options.executables_only) + u8::from(options.relink.is_some());
+    let status = Status::new(options.verbose, steps, started);
+    status.phase(Phase::Reading, 0, 0);
+    status.set_file(&options.package.display().to_string());
     let src = Source::open(&options.package)?;
     let fih = Fih::read(&src)?;
     let cnt = Cnt::read(&src, fih.cnt_offset)?;
-    println!("package     {}", options.package.display());
-    println!("content ID  {}", cnt.content_id);
-    println!("FIH         format {}, PFS {:#x}+{:#x}", fih.format_version, fih.pfs_offset, fih.pfs_size);
+    status.line(format!("package     {}", options.package.display()));
+    status.line(format!("content ID  {}", cnt.content_id));
+    status.line(format!("FIH         format {}, PFS {:#x}+{:#x}", fih.format_version, fih.pfs_offset, fih.pfs_size));
 
     let outer = OuterPfs::open(&src, fih.pfs_offset, fih.pfs_size, fih.superblock_offset)?;
-    println!(
+    status.line(format!(
         "outer PFS   {} inodes, block size {:#x}, seed {}",
         outer.inode_count(),
         outer.superblock().block_size,
         String::from_utf8_lossy(&outer.superblock().seed)
-    );
+    ));
     let image_ino = outer.find("pfs_image.dat")?.ok_or_else(|| Error::format("the outer PFS has no pfs_image.dat"))?;
     let naps_ino = outer
         .find("naps_pkg_layout.dat")?
@@ -188,19 +206,20 @@ fn run(options: &Options) -> Result<()> {
     }
     let naps_blob = naps_file.read_all()?;
     let image = InnerImage::open(outer.file(image_ino)?, &naps_blob)?;
-    println!(
+    status.line(format!(
         "inner image {:.2} GiB logical in {} blocks ({} stored, {} Kraken, {} sparse)",
         gib(image.mount),
         image.block_count(),
         image.stats.stored,
         image.stats.kraken,
         image.stats.sparse
-    );
+    ));
     let files = image.files()?;
     let total: u64 = files.iter().map(|f| f.size).sum();
-    println!("files       {} under uroot, {:.2} GiB", files.len(), gib(total));
+    status.line(format!("files       {} under uroot, {:.2} GiB", files.len(), gib(total)));
 
     if options.list {
+        status.close();
         for file in &files {
             println!("{:>16}  {}", file.size, file.path);
         }
@@ -226,6 +245,7 @@ fn run(options: &Options) -> Result<()> {
     if !executables.iter().any(|f| f.path == "eboot.bin") {
         return Err(Error::format("the package has no eboot.bin"));
     }
+    status.phase(Phase::Unwrapping, executables.iter().map(|f| f.size).sum(), executables.len() as u64);
     // source/ mirrors the game tree: eboot.bin and sce_module/ beside it, and
     // every other game module unwrapped at its own path. The relinker looks
     // up needed modules anywhere under source/ and writes each converted
@@ -236,8 +256,11 @@ fn run(options: &Options) -> Result<()> {
         if file.size > MAX_EXECUTABLE_SIZE {
             return Err(Error::format(format!("{} is {} bytes, too large for an executable", file.path, file.size)));
         }
+        status.set_file(&file.path);
         let mut bytes = vec![0u8; file.size as usize];
         image.read_at(file.logical, &mut bytes)?;
+        status.advance(file.size);
+        status.file_done();
         let unwrapped = if selfelf::is_self(&bytes) {
             selfelf::unwrap(&bytes).map(Some)
         } else if selfelf::is_elf(&bytes) {
@@ -251,12 +274,12 @@ fn run(options: &Options) -> Result<()> {
             Ok(None) => continue,
             Err(err) if required => return Err(Error::format(format!("{}: {err}", file.path))),
             Err(err) => {
-                println!("  skipped {}: {err}", file.path);
+                status.line(format!("  skipped {}: {err}", file.path));
                 continue;
             }
         };
         write_file(&join_inside(&source_dir, &file.path)?, &elf)?;
-        println!("  source/{:<40} ELF type {:#06x}, {} bytes", file.path, selfelf::elf_type(&elf).unwrap_or(0), elf.len());
+        status.line(format!("  source/{:<40} ELF type {:#06x}, {} bytes", file.path, selfelf::elf_type(&elf).unwrap_or(0), elf.len()));
     }
 
     if !options.executables_only {
@@ -264,25 +287,27 @@ fn run(options: &Options) -> Result<()> {
         for cnt_file in &cnt.files {
             write_file(&join_inside(&app0.join("sce_sys"), &cnt_file.name)?, &cnt_file.bytes)?;
         }
-        println!(
+        status.line(format!(
             "  app0/sce_sys/  {} metadata files from the CNT ({} encrypted entries skipped)",
             cnt.files.len(),
             cnt.skipped_encrypted.len()
-        );
-        let written = copy_resources(&image, &resources, &app0, options.jobs, started)?;
-        println!("  app0/  {} files, {:.2} GiB", resources.len(), gib(written));
+        ));
+        status.phase(Phase::Copying, resources.iter().map(|f| f.size).sum(), resources.len() as u64);
+        let written = copy_resources(&image, &resources, &app0, options.jobs, started, &status)?;
+        status.line(format!("  app0/  {} files, {:.2} GiB", resources.len(), gib(written)));
     }
 
     if let Some(build) = &options.relink {
-        relink(build, out, options.windows, &options.module_dirs)?;
+        status.phase(Phase::Relinking, 0, 0);
+        relink(build, out, options.windows, &options.module_dirs, &status)?;
     }
-    println!("done in {:.1} s", started.elapsed().as_secs_f64());
+    status.finish();
     Ok(())
 }
 
 /// Copies files on `jobs` threads, largest first so the long files start
 /// early. The first error stops the other threads and is returned.
-fn copy_resources(image: &InnerImage, files: &[&InnerFile], app0: &Path, jobs: usize, started: Instant) -> Result<u64> {
+fn copy_resources(image: &InnerImage, files: &[&InnerFile], app0: &Path, jobs: usize, started: Instant, status: &Status) -> Result<u64> {
     let mut order: Vec<&InnerFile> = files.to_vec();
     order.sort_by_key(|f| std::cmp::Reverse(f.size));
     let total: u64 = order.iter().map(|f| f.size).sum();
@@ -296,8 +321,14 @@ fn copy_resources(image: &InnerImage, files: &[&InnerFile], app0: &Path, jobs: u
             scope.spawn(|| {
                 while !failed.load(Ordering::Relaxed) {
                     let Some(file) = order.get(next.fetch_add(1, Ordering::Relaxed)) else { break };
+                    status.set_file(&file.path);
                     let result = copy_one(image, file, app0, &failed, |n| {
                         let done = written.fetch_add(n, Ordering::Relaxed) + n;
+                        status.advance(n);
+                        // The status line shows progress continuously.
+                        if status.is_verbose() {
+                            return;
+                        }
                         let due = next_report.load(Ordering::Relaxed);
                         if done >= due && next_report.compare_exchange(due, done + (4 << 30), Ordering::Relaxed, Ordering::Relaxed).is_ok()
                         {
@@ -305,9 +336,12 @@ fn copy_resources(image: &InnerImage, files: &[&InnerFile], app0: &Path, jobs: u
                             println!("  app0/  {:.2} / {:.2} GiB ({:.2} GiB/s)", gib(done), gib(total), rate);
                         }
                     });
-                    if let Err(err) = result {
-                        failed.store(true, Ordering::Relaxed);
-                        first_error.lock().unwrap().get_or_insert(err);
+                    match result {
+                        Ok(()) => status.file_done(),
+                        Err(err) => {
+                            failed.store(true, Ordering::Relaxed);
+                            first_error.lock().unwrap().get_or_insert(err);
+                        }
                     }
                 }
             });
@@ -389,7 +423,7 @@ fn is_game_module(path: &str) -> bool {
     module && !path.starts_with("fakelib/") && !path.starts_with("sce_sys/")
 }
 
-fn relink(build: &Path, out: &Path, windows: bool, module_dirs: &[String]) -> Result<()> {
+fn relink(build: &Path, out: &Path, windows: bool, module_dirs: &[String], status: &Status) -> Result<()> {
     let relinker = build.join(format!("core/relinker/relinker{}", std::env::consts::EXE_SUFFIX));
     let libs = build.join("core/libs/libs");
     if !relinker.is_file() {
@@ -404,10 +438,11 @@ fn relink(build: &Path, out: &Path, windows: bool, module_dirs: &[String]) -> Re
         command.arg("--module-dir").arg(dir);
     }
     command.arg(out.join("source/eboot.bin")).arg(&output);
-    println!("relink      {}", relinker.display());
-    let status = command.status().map_err(Error::io(format!("run {}", relinker.display())))?;
-    if !status.success() {
-        return Err(Error::format(format!("the relinker failed ({status})")));
+    status.set_file(&format!("source/eboot.bin → {}", output.file_name().unwrap_or_default().to_string_lossy()));
+    status.line(format!("relink      {}", relinker.display()));
+    let exit = status.run(&mut command).map_err(Error::io(format!("run {}", relinker.display())))?;
+    if !exit.success() {
+        return Err(Error::format(format!("the relinker failed ({exit})")));
     }
     #[cfg(unix)]
     if !windows {
@@ -424,7 +459,7 @@ fn relink(build: &Path, out: &Path, windows: bool, module_dirs: &[String]) -> Re
             copied += 1;
         }
     }
-    println!("  {} and libs/ ({copied} system libraries) are ready", output.display());
+    status.line(format!("  {} and libs/ ({copied} system libraries) are ready", output.display()));
     Ok(())
 }
 
