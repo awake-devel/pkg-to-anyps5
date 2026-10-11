@@ -1624,13 +1624,17 @@ mod tests {
         let status = Status::new(false, 4, Instant::now());
         status.phase(Phase::Reading, 0, 0);
         std::thread::sleep(Duration::from_millis(60));
+        // Bounds come from the clock, not the sleeps: CI runners oversleep.
+        let before = Instant::now();
         status.phase(Phase::Copying, 10, 1);
         std::thread::sleep(Duration::from_millis(60));
         status.phase(Phase::Relinking, 0, 0);
+        let copying = before.elapsed();
         std::thread::sleep(Duration::from_millis(120));
         status.shared.close_phase();
         let moving = Duration::from_micros(status.shared.moving_us.load(Ordering::Relaxed));
-        assert!(moving >= Duration::from_millis(60) && moving < Duration::from_millis(170), "{moving:?}");
+        // Counting reading or relinking would add 60 or 120 ms on top.
+        assert!(moving >= Duration::from_millis(60) && moving <= copying + Duration::from_millis(1), "{moving:?} vs {copying:?}");
         status.close();
     }
 
