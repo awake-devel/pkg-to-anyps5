@@ -57,11 +57,12 @@ fn format_bytes(n: u64) -> String {
     if unit == 0 {
         return format!("{n} B");
     }
-    let digits = match value {
-        v if v < 9.995 => format!("{v:.2}"),
-        v if v < 99.95 => format!("{v:.1}"),
-        v => format!("{v:.0}"),
-    };
+    // Two decimals below 10, one from there up; 1024.0 rolls over.
+    let mut digits = if value < 9.995 { format!("{value:.2}") } else { format!("{value:.1}") };
+    if digits == "1024.0" && unit < UNITS.len() - 1 {
+        unit += 1;
+        digits = "1.00".to_owned();
+    }
     format!("{digits} {}", UNITS[unit])
 }
 

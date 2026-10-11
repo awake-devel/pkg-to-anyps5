@@ -135,7 +135,7 @@ fn assert_plain_demo(output: &str) {
     let order = [
         "» [1/4] reading package",
         "package     demo.pkg",
-        "» [2/4] unwrapping executables: 6 files, 186 MiB",
+        "» [2/4] unwrapping executables: 6 files, 186.0 MiB",
         "  source/eboot.bin ",
         "» [3/4] copying app0: 45 files, ",
         "  app0/  45 files, ",

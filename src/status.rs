@@ -800,24 +800,44 @@ fn three_digits(v: f64) -> String {
     }
 }
 
+/// A size's unit and how many decimals to show: two below 10, one from
+/// there up, so a 134 GiB package reads 134.4 GiB rather than 134 GiB. A
+/// value that would round to 1024 moves to the next unit: 1.00 GiB, not
+/// 1024.0 MiB.
+fn size_unit(n: u64) -> (usize, usize) {
+    let mut unit = unit_of(n as f64);
+    if unit == 0 {
+        return (0, 0);
+    }
+    loop {
+        let value = n as f64 / 1024f64.powi(unit as i32);
+        let decimals = if value < 9.995 { 2 } else { 1 };
+        let rounds_up = format!("{value:.decimals$}").parse::<f64>().is_ok_and(|v| v >= 1024.0);
+        if rounds_up && unit < UNITS.len() - 1 {
+            unit += 1;
+        } else {
+            return (unit, decimals);
+        }
+    }
+}
+
 fn format_bytes(n: u64) -> String {
-    let unit = unit_of(n as f64);
+    let (unit, decimals) = size_unit(n);
     if unit == 0 {
         return format!("{n} B");
     }
-    format!("{} {}", three_digits(n as f64 / 1024f64.powi(unit as i32)), UNITS[unit])
+    format!("{:.decimals$} {}", n as f64 / 1024f64.powi(unit as i32), UNITS[unit])
 }
 
-/// Done and total in the total's unit and precision: "3.27/7.73 GiB".
+/// Done and total in the total's unit and precision: "3.27/7.73 GiB",
+/// "85.3/134.4 GiB".
 fn format_pair(done: u64, total: u64) -> String {
-    let unit = unit_of(total as f64);
+    let (unit, decimals) = size_unit(total);
     if unit == 0 {
         return format!("{done}/{total} B");
     }
     let scale = 1024f64.powi(unit as i32);
-    let total_text = three_digits(total as f64 / scale);
-    let decimals = total_text.split_once('.').map_or(0, |(_, d)| d.len());
-    format!("{:.decimals$}/{total_text} {}", done as f64 / scale, UNITS[unit])
+    format!("{:.decimals$}/{:.decimals$} {}", done as f64 / scale, total as f64 / scale, UNITS[unit])
 }
 
 fn format_rate(bytes_per_second: f64) -> String {
@@ -1342,15 +1362,77 @@ mod tests {
         assert_eq!(format_bytes(0), "0 B");
         assert_eq!(format_bytes(1023), "1023 B");
         assert_eq!(format_bytes(1024), "1.00 KiB");
-        assert_eq!(format_bytes(123 << 20), "123 MiB");
+        assert_eq!(format_bytes(123 << 20), "123.0 MiB");
         assert_eq!(format_bytes(8_300_000_000), "7.73 GiB");
         assert_eq!(format_bytes(10_000 << 20), "9.77 GiB");
         assert_eq!(format_pair(3_511_000_000, 8_300_000_000), "3.27/7.73 GiB");
-        assert_eq!(format_pair(0, 186 << 20), "0/186 MiB");
+        assert_eq!(format_pair(0, 186 << 20), "0.0/186.0 MiB");
         assert_eq!(format_pair(7, 900), "7/900 B");
         assert_eq!(format_rate(412.0 * 1048576.0), "412 MiB/s");
         assert_eq!(format_rate(0.0), "0 B/s");
         assert_eq!(format_rate(f64::NAN), "0 B/s");
+    }
+
+    #[test]
+    fn sizes_from_100_up_keep_a_decimal() {
+        const MIB: f64 = 1048576.0;
+        const GIB: f64 = 1073741824.0;
+        let gib = |v: f64| (v * GIB).round() as u64;
+        let mib = |v: f64| (v * MIB).round() as u64;
+        // A 134 GiB package.
+        assert_eq!(format_bytes(gib(134.43)), "134.4 GiB");
+        assert_eq!(format_pair(gib(85.3), gib(134.43)), "85.3/134.4 GiB");
+        assert_eq!(format_pair(0, gib(134.43)), "0.0/134.4 GiB");
+        assert_eq!(format_pair(gib(134.43), gib(134.43)), "134.4/134.4 GiB");
+        assert_eq!(format_bytes(mib(750.0)), "750.0 MiB");
+        assert_eq!(format_pair(mib(512.0), mib(750.0)), "512.0/750.0 MiB");
+        // Around 100.
+        assert_eq!(format_bytes(mib(99.9)), "99.9 MiB");
+        assert_eq!(format_bytes(mib(99.96)), "100.0 MiB");
+        assert_eq!(format_bytes(mib(100.0)), "100.0 MiB");
+        assert_eq!(format_bytes(mib(999.95) + 1), "1000.0 MiB");
+        assert_eq!(format_bytes(mib(999.94)), "999.9 MiB");
+        // Rounding to 1024 moves to the next unit.
+        assert_eq!(format_bytes(mib(1023.94)), "1023.9 MiB");
+        assert_eq!(format_bytes(mib(1023.96)), "1.00 GiB");
+        assert_eq!(format_bytes((1u64 << 30) - 1), "1.00 GiB");
+        assert_eq!(format_pair(mib(512.0), mib(1023.96)), "0.50/1.00 GiB");
+        assert_eq!(format_bytes(1023 * 1024 + 10), "1023.0 KiB");
+        assert_eq!(format_bytes(1023 * 1024 + 1000), "1.00 MiB");
+        assert_eq!(format_bytes(1024 * 1024 - 1), "1.00 MiB");
+        // Below 100: unchanged.
+        assert_eq!(format_bytes(mib(9.87)), "9.87 MiB");
+        assert_eq!(format_bytes(gib(24.5)), "24.5 GiB");
+        assert_eq!(format_bytes(gib(7.7)), "7.70 GiB");
+        assert_eq!(format_pair(gib(3.27), gib(7.73)), "3.27/7.73 GiB");
+        // Bytes stay whole.
+        assert_eq!(format_bytes(999), "999 B");
+        assert_eq!(format_pair(0, 999), "0/999 B");
+        assert_eq!(format_pair(999, 999), "999/999 B");
+        // Speeds are not sizes.
+        assert_eq!(format_rate(134.4 * GIB), "134 GiB/s");
+    }
+
+    #[test]
+    fn a_134_gib_copy_fits_every_width() {
+        let view = View { done: 85 << 30, total: 134 << 30, ..copying(0, 0) };
+        let wide = visible(&render_line(&view, 200, 1));
+        assert!(wide.contains(" 85.0/134.0 GiB"), "{wide:?}");
+        for cols in 10..220 {
+            let line = visible(&render_line(&view, cols, 1));
+            assert!(str_width(&line) < cols, "{cols}: {line:?}");
+        }
+        let summary = Summary {
+            outcome: Outcome::Done,
+            phase: Phase::Copying,
+            done: 0,
+            total: 0,
+            bytes: (134.9 * 1073741824.0) as u64,
+            files: 170,
+            elapsed: Duration::from_secs(600),
+            moving: Duration::from_secs(580),
+        };
+        assert!(render_summary(&summary, false).starts_with("✓ done  134.9 GiB · 170 files · 10:00 · avg "));
     }
 
     #[test]
