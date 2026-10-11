@@ -16,8 +16,8 @@ use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use error::{Error, Result};
@@ -28,8 +28,8 @@ use source::Source;
 use status::{Phase, Status};
 
 const USAGE: &str = "\
-usage: pkg-to-anyps5 <package.pkg> <output-dir> [options]
-       pkg-to-anyps5 <package.pkg> --list
+usage: pkg-to-anyps5 <package.pkg|game-dir> <output-dir> [options]
+         pkg-to-anyps5 <package.pkg|game-dir> --list
 
 Writes:
   <output-dir>/source/eboot.bin          main executable, unwrapped to ELF (relinker input)
@@ -39,16 +39,16 @@ Writes:
   <output-dir>/app0/                     every other game file, plus sce_sys/ metadata
 
 options:
-  --list               print the package's files and sizes, write nothing
+    --list               print the input's files and sizes, write nothing
   --executables-only   write source/ only (seconds instead of a full copy)
-  --jobs <n>           files decoded at once (default 4)
+    --jobs <n>           files decoded or copied at once (default 4)
   --only <path>        write only app0/ files at or under this path (repeatable)
   --relink <build-dir> afterwards run <build-dir>/core/relinker/relinker on
                        source/eboot.bin to make <output-dir>/app.elf, and copy
                        <build-dir>/core/libs/libs/*.prx into <output-dir>/libs/
                        DEPRECATED: no longer maintained, removed in v1
-  --module-dir <dir>   with --relink: also convert the modules of this package
-                       directory that the game loads at run time, such as Unity's
+    --module-dir <dir>   with --relink: also convert the modules of this input
+                                             tree that the game loads at run time, such as Unity's
                        Media/Plugins (needs a relinker with --module-dir, AnyPS5 #846)
                        DEPRECATED with --relink, removed in v1
   --windows            with --relink: produce app.exe for Windows instead
@@ -188,6 +188,10 @@ fn main() -> ExitCode {
 }
 
 fn run(options: &Options) -> Result<()> {
+    if options.package.is_dir() {
+        return run_directory(options);
+    }
+
     let started = Instant::now();
     let steps = 2 + u8::from(!options.executables_only) + u8::from(options.relink.is_some());
     let status = Status::new(options.verbose, steps, started);
@@ -319,6 +323,113 @@ fn run(options: &Options) -> Result<()> {
         relink(build, out, options.windows, &options.module_dirs, &status)?;
     }
     status.finish();
+    Ok(())
+}
+
+#[derive(Debug)]
+struct DirectoryFile {
+    path: String,
+    size: u64,
+}
+
+fn run_directory(options: &Options) -> Result<()> {
+    let started = Instant::now();
+    let mut files = Vec::new();
+    collect_directory_files(&options.package, &options.package, &mut files)?;
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    let total: u64 = files.iter().map(|file| file.size).sum();
+    println!("directory   {}", options.package.display());
+    println!("files       {}, {:.2} GiB", files.len(), gib(total));
+
+    if options.list {
+        for file in &files {
+            println!("{:>16}  {}", file.size, file.path);
+        }
+        return Ok(());
+    }
+
+    let out = options.output.as_deref().expect("checked in parse_args");
+    let source_dir = out.join("source");
+    let app0 = out.join("app0");
+    create_dir(&source_dir)?;
+
+    let executables: Vec<&DirectoryFile> = files.iter().filter(|f| is_relinker_input(&f.path) || is_game_module(&f.path)).collect();
+    let mut resources: Vec<&DirectoryFile> = files.iter().filter(|f| !is_relinker_input(&f.path)).collect();
+    if !options.only.is_empty() {
+        resources.retain(|f| options.only.iter().any(|p| f.path == *p || f.path.starts_with(&format!("{p}/"))));
+        if resources.is_empty() {
+            return Err(Error::format(format!("no app0/ file matches --only {}", options.only.join(", "))));
+        }
+    }
+    if !executables.iter().any(|f| f.path == "eboot.bin") {
+        return Err(Error::format("the directory has no eboot.bin"));
+    }
+
+    for file in &executables {
+        let required = is_relinker_input(&file.path);
+        if file.size > MAX_EXECUTABLE_SIZE {
+            return Err(Error::format(format!("{} is {} bytes, too large for an executable", file.path, file.size)));
+        }
+        let input = options.package.join(&file.path);
+        let bytes = fs::read(&input).map_err(Error::io(format!("read {}", input.display())))?;
+        let unwrapped = if selfelf::is_self(&bytes) {
+            selfelf::unwrap(&bytes).map(Some)
+        } else if selfelf::is_elf(&bytes) {
+            Ok(Some(bytes))
+        } else {
+            Ok(None)
+        };
+        let elf = match unwrapped {
+            Ok(Some(elf)) => elf,
+            Ok(None) if required => return Err(Error::format(format!("{} is neither a SELF nor an ELF", file.path))),
+            Ok(None) => continue,
+            Err(err) if required => return Err(Error::format(format!("{}: {err}", file.path))),
+            Err(err) => {
+                println!("  skipped {}: {err}", file.path);
+                continue;
+            }
+        };
+        write_file(&join_inside(&source_dir, &file.path)?, &elf)?;
+        println!("  source/{:<40} ELF type {:#06x}, {} bytes", file.path, selfelf::elf_type(&elf).unwrap_or(0), elf.len());
+    }
+
+    if !options.executables_only {
+        create_dir(&app0.join("sce_sys"))?;
+        for file in &resources {
+            let input = options.package.join(&file.path);
+            let target = join_inside(&app0, &file.path)?;
+            if let Some(parent) = target.parent() {
+                create_dir(parent)?;
+            }
+            fs::copy(&input, &target).map_err(Error::io(format!("copy {}", input.display())))?;
+        }
+        println!("  app0/  {} files, {:.2} GiB", resources.len(), gib(resources.iter().map(|file| file.size).sum()));
+    }
+
+    if let Some(build) = &options.relink {
+        relink(build, out, options.windows, &options.module_dirs)?;
+    }
+    println!("done in {:.1} s", started.elapsed().as_secs_f64());
+    Ok(())
+}
+
+fn collect_directory_files(root: &Path, directory: &Path, files: &mut Vec<DirectoryFile>) -> Result<()> {
+    for entry in fs::read_dir(directory).map_err(Error::io(format!("list {}", directory.display())))? {
+        let entry = entry.map_err(Error::io(format!("list {}", directory.display())))?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(Error::io(format!("inspect {}", path.display())))?;
+        if file_type.is_dir() {
+            collect_directory_files(root, &path, files)?;
+        } else if file_type.is_file() {
+            let relative = path.strip_prefix(root).expect("walked below root");
+            let relative = relative.to_str().ok_or_else(|| Error::format("directory contains a non-UTF-8 path"))?.replace('\\', "/");
+            join_inside(Path::new(""), &relative)?;
+            let size = entry.metadata().map_err(Error::io(format!("inspect {}", path.display())))?.len();
+            files.push(DirectoryFile { path: relative, size });
+        } else {
+            return Err(Error::unsupported(format!("{} is not a regular file or directory", path.display())));
+        }
+    }
     Ok(())
 }
 
@@ -540,5 +651,24 @@ mod tests {
         assert!(!is_game_module("fakelib/libSceAgc.sprx"));
         assert!(!is_game_module("sce_sys/about/right.sprx"));
         assert!(!is_game_module("Media/level0"));
+    }
+
+    #[test]
+    fn directory_files_are_listed_with_relative_forward_slash_paths() {
+        let root = std::env::temp_dir().join(format!("pkg-to-anyps5-test-{}", std::process::id()));
+        let nested = root.join("sce_module");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(root.join("eboot.bin"), b"elf").unwrap();
+        fs::write(nested.join("module.prx"), b"prx").unwrap();
+
+        let mut files = Vec::new();
+        collect_directory_files(&root, &root, &mut files).unwrap();
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+
+        assert_eq!(
+            files.iter().map(|file| (file.path.as_str(), file.size)).collect::<Vec<_>>(),
+            [("eboot.bin", 3), ("sce_module/module.prx", 3)]
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

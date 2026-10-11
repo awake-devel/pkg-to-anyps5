@@ -40,6 +40,12 @@ pkg-to-anyps5 game.pkg --list
 # Executables only (seconds)
 pkg-to-anyps5 game.pkg out --executables-only
 
+# Use an already-extracted game directory (no .pkg needed)
+pkg-to-anyps5 extracted-game/ out --relink ~/AnyPS5/build
+
+# Executables only (seconds), then relink with an AnyPS5 build
+pkg-to-anyps5 game.pkg out --executables-only --relink ~/AnyPS5/build
+
 # Everything: executables and every game file, with a live progress line
 pkg-to-anyps5 game.pkg out --verbose
 
@@ -54,18 +60,22 @@ pkg-to-anyps5 game.pkg out --verbose
 
 | Option | Effect |
 |---|---|
-| `--list` | Print the package's files and sizes; write nothing. |
+| `--list` | Print the input's files and sizes; write nothing. |
 | `--executables-only` | Write `source/` only (seconds instead of a full copy). |
-| `--jobs <n>` | Files decoded at once (default 4). |
+| `--jobs <n>` | Files decoded or copied at once (default 4). |
 | `--only <path>` | Write only the `app0/` files at or under a path (repeatable), to check a few files without copying a whole game. |
 | `--relink <build-dir>` | **Deprecated, removed in v1.** Afterwards run `<build-dir>/core/relinker/relinker` (`relinker.exe` on Windows) on `source/eboot.bin` to make `app.elf`, and copy AnyPS5's system libraries into `libs/`. |
-| `--module-dir <dir>` | **Deprecated with `--relink`.** With `--relink`: also convert the modules of this package directory that the game loads at run time, such as Unity's `Media/Plugins` (needs a relinker with `--module-dir`). Repeatable. |
+| `--module-dir <dir>` | **Deprecated with `--relink`.** With `--relink`: also convert the modules of the input tree that the game loads at run time, such as Unity's `Media/Plugins` (needs a relinker with `--module-dir`). Repeatable. |
 | `--windows` | **Deprecated with `--relink`.** With `--relink`: produce `app.exe` for Windows instead. |
 | `-v`, `--verbose` | Show a live status line while converting: the phase, a progress bar, bytes done, speed, ETA and the file being written, ending with a one-line summary. Without a terminal, or with `NO_COLOR` set, it prints plain progress lines instead. |
 | `-h`, `--help` / `-V`, `--version` | Print help or the version. |
 
 Exit status is 0 on success, 1 for a usage error and 2 when the package
 cannot be read.
+
+The input can be either a debug `.pkg` or an existing game directory containing
+`eboot.bin`. Directory input skips package parsing and copies any existing
+`sce_sys/` files from that tree into `app0/`.
 
 Output:
 
