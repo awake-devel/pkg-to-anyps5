@@ -65,7 +65,8 @@ const MAX_EXECUTABLE_SIZE: u64 = 2 << 30;
 
 /// Printed whenever --relink is used, until the option is removed in v1.
 const RELINK_DEPRECATED: &str = "warning: --relink (with --module-dir and --windows) is no longer maintained \
-and will be removed in v1; run the AnyPS5 relinker on <output-dir>/source/eboot.bin yourself";
+and will be removed in v1; run the AnyPS5 relinker on <output-dir>/source/eboot.bin yourself, \
+or vote to keep it at https://github.com/awake-devel/pkg-to-anyps5/discussions/3";
 
 enum Parsed {
     Run(Options),
@@ -248,7 +249,7 @@ fn run(options: &Options) -> Result<()> {
     let app0 = out.join("app0");
     create_dir(&source_dir)?;
 
-    let (executables, resources) = select_game_files(&files, options, "package")?;
+    let (executables, resources) = select_game_files(&files, options)?;
     status.phase(Phase::Unwrapping, executables.iter().map(|f| f.size).sum(), executables.len() as u64);
     // source/ mirrors the game tree: eboot.bin and sce_module/ beside it, and
     // every other game module unwrapped at its own path. The relinker looks
@@ -301,6 +302,8 @@ trait GameFile {
     fn path(&self) -> &str;
     fn size(&self) -> u64;
     fn output_path(&self, base: &Path) -> Result<PathBuf>;
+    /// An error about the input this file came from.
+    fn invalid(message: String) -> Error;
 }
 
 impl GameFile for InnerFile {
@@ -314,6 +317,10 @@ impl GameFile for InnerFile {
 
     fn output_path(&self, base: &Path) -> Result<PathBuf> {
         join_inside(base, &self.path)
+    }
+
+    fn invalid(message: String) -> Error {
+        Error::format(message)
     }
 }
 
@@ -329,19 +336,23 @@ impl GameFile for DirectoryFile {
     fn output_path(&self, base: &Path) -> Result<PathBuf> {
         join_directory_inside(base, &self.path)
     }
+
+    fn invalid(message: String) -> Error {
+        Error::directory(message)
+    }
 }
 
-fn select_game_files<'a, T: GameFile>(files: &'a [T], options: &Options, input_name: &str) -> Result<(Vec<&'a T>, Vec<&'a T>)> {
+fn select_game_files<'a, T: GameFile>(files: &'a [T], options: &Options) -> Result<(Vec<&'a T>, Vec<&'a T>)> {
     let executables: Vec<&T> = files.iter().filter(|f| is_relinker_input(f.path()) || is_game_module(f.path())).collect();
     let mut resources: Vec<&T> = files.iter().filter(|f| !is_relinker_input(f.path())).collect();
     if !options.only.is_empty() {
         resources.retain(|f| options.only.iter().any(|p| f.path() == p || f.path().starts_with(&format!("{p}/"))));
         if resources.is_empty() {
-            return Err(Error::format(format!("no app0/ file matches --only {}", options.only.join(", "))));
+            return Err(Error::run(format!("no app0/ file matches --only {}", options.only.join(", "))));
         }
     }
     if !executables.iter().any(|f| f.path() == "eboot.bin") {
-        return Err(Error::format(format!("the {input_name} has no eboot.bin")));
+        return Err(T::invalid("there is no eboot.bin".to_owned()));
     }
     Ok((executables, resources))
 }
@@ -356,7 +367,7 @@ fn write_executables<T: GameFile>(
         let path = file.path();
         let required = is_relinker_input(path);
         if file.size() > MAX_EXECUTABLE_SIZE {
-            return Err(Error::format(format!("{path} is {} bytes, too large for an executable", file.size())));
+            return Err(T::invalid(format!("{path} is {} bytes, too large for an executable", file.size())));
         }
         status.set_file(path);
         let bytes = read_file(file)?;
@@ -371,9 +382,9 @@ fn write_executables<T: GameFile>(
         };
         let elf = match unwrapped {
             Ok(Some(elf)) => elf,
-            Ok(None) if required => return Err(Error::format(format!("{path} is neither a SELF nor an ELF"))),
+            Ok(None) if required => return Err(T::invalid(format!("{path} is neither a SELF nor an ELF"))),
             Ok(None) => continue,
-            Err(err) if required => return Err(Error::format(format!("{path}: {err}"))),
+            Err(err) if required => return Err(T::invalid(format!("{path}: {err}"))),
             Err(err) => {
                 status.line(format!("  skipped {path}: {err}"));
                 continue;
@@ -407,10 +418,10 @@ fn run_directory(options: &Options) -> Result<()> {
         // An output directory that merely contains the input is fine.
         let written = ["source", "app0", "libs", "app.elf", "app.exe", PARTIAL_DIR].map(|p| output_path.join(p));
         if output_path.starts_with(&input_path) {
-            return Err(Error::format("the output directory must not be the input directory or inside it"));
+            return Err(Error::run("the output directory must not be the input directory or inside it"));
         }
         if let Some(clash) = written.iter().find(|p| input_path.starts_with(p)) {
-            return Err(Error::format(format!("the input directory is inside {}, which this run writes", clash.display())));
+            return Err(Error::run(format!("the input directory is inside {}, which this run writes", clash.display())));
         }
         Some(output)
     };
@@ -435,7 +446,7 @@ fn run_directory(options: &Options) -> Result<()> {
     let app0 = out.join("app0");
     create_dir(&source_dir)?;
 
-    let (executables, resources) = select_game_files(&files, options, "directory")?;
+    let (executables, resources) = select_game_files(&files, options)?;
 
     status.phase(Phase::Unwrapping, executables.iter().map(|f| f.size).sum(), executables.len() as u64);
     write_executables(&executables, &source_dir, &status, |file| {
@@ -525,9 +536,9 @@ fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf> {
         match fs::symlink_metadata(existing) {
             Ok(_) => break,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                let name = existing.file_name().ok_or_else(|| Error::format(format!("cannot resolve output path {}", path.display())))?;
+                let name = existing.file_name().ok_or_else(|| Error::run(format!("cannot resolve output path {}", path.display())))?;
                 missing.push(name.to_owned());
-                existing = existing.parent().ok_or_else(|| Error::format(format!("cannot resolve output path {}", path.display())))?;
+                existing = existing.parent().ok_or_else(|| Error::run(format!("cannot resolve output path {}", path.display())))?;
             }
             Err(err) => return Err(Error::io(format!("resolve {}", path.display()))(err)),
         }
@@ -565,7 +576,7 @@ fn collect_directory_files(
             collect_directory_files(root, &path, ancestors, files, status)?;
         } else if metadata.is_file() {
             let relative = path.strip_prefix(root).expect("walked below root");
-            let relative = relative.to_str().ok_or_else(|| Error::unsupported(format!("{} is not a UTF-8 path", path.display())))?;
+            let relative = relative.to_str().ok_or_else(|| Error::directory(format!("{} is not a UTF-8 path", path.display())))?;
             #[cfg(windows)]
             let relative = relative.replace('\\', "/");
             #[cfg(not(windows))]
@@ -679,7 +690,7 @@ fn join_inside(base: &Path, relative: &str) -> Result<PathBuf> {
 /// `:` are ordinary characters of a Unix file name.
 fn join_directory_inside(base: &Path, relative: &str) -> Result<PathBuf> {
     if !fih::has_plain_components(relative) || (cfg!(windows) && !is_windows_safe_path(relative)) {
-        return Err(Error::format(format!("refusing to write the unsafe directory path {relative:?}")));
+        return Err(Error::directory(format!("refusing to write the unsafe path {relative:?}")));
     }
     Ok(base.join(relative))
 }
@@ -724,7 +735,7 @@ fn relink(build: &Path, out: &Path, windows: bool, module_dirs: &[String], statu
     let relinker = build.join(format!("core/relinker/relinker{}", std::env::consts::EXE_SUFFIX));
     let libs = build.join("core/libs/libs");
     if !relinker.is_file() {
-        return Err(Error::format(format!("no relinker at {}", relinker.display())));
+        return Err(Error::run(format!("no relinker at {}", relinker.display())));
     }
     let output = out.join(if windows { "app.exe" } else { "app.elf" });
     let mut command = Command::new(&relinker);
@@ -739,7 +750,7 @@ fn relink(build: &Path, out: &Path, windows: bool, module_dirs: &[String], statu
     status.line(format!("relink      {}", relinker.display()));
     let exit = status.run(&mut command).map_err(Error::io(format!("run {}", relinker.display())))?;
     if !exit.success() {
-        return Err(Error::format(format!("the relinker failed ({exit})")));
+        return Err(Error::run(format!("the relinker failed ({exit})")));
     }
     #[cfg(unix)]
     if !windows {

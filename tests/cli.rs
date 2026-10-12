@@ -51,6 +51,7 @@ fn relink_is_marked_deprecated() {
     let stderr = text(&out.stderr);
     let (warning, error) = stderr.split_once('\n').unwrap();
     assert!(warning.starts_with("warning: --relink") && warning.contains("removed in v1"), "{stderr}");
+    assert!(warning.contains("/discussions/3"), "the warning links the discussion: {stderr}");
     assert!(error.starts_with("error: open "), "the run still goes ahead: {stderr}");
     assert!(out.stdout.is_empty(), "the warning stays off stdout");
 
@@ -110,6 +111,25 @@ fn errors_without_verbose_print_what_they_always_did() {
         let list = run(&[package.to_str().unwrap(), "--list"]);
         assert_eq!(text(&list.stderr), expected);
         assert!(list.stdout.is_empty());
+    }
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn folder_errors_do_not_call_the_input_a_package() {
+    let dir = scratch("folder-errors");
+    let game = dir.join("game");
+    fs::create_dir_all(&game).unwrap();
+    fs::write(game.join("data.bin"), b"data").unwrap();
+    let game = game.to_str().unwrap();
+    let cases = [
+        (vec![game.to_owned(), dir.join("out").to_str().unwrap().to_owned()], "error: invalid game directory: there is no eboot.bin\n"),
+        (vec![game.to_owned(), format!("{game}/out")], "error: the output directory must not be the input directory or inside it\n"),
+    ];
+    for (args, expected) in cases {
+        let out = run(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(out.status.code(), Some(2));
+        assert_eq!(text(&out.stderr), expected);
     }
     fs::remove_dir_all(&dir).unwrap();
 }

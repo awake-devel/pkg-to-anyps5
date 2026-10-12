@@ -7,6 +7,11 @@ pub enum Error {
     Io(String, std::io::Error),
     Format(String),
     Unsupported(String),
+    /// A game directory given as input that cannot be converted.
+    Directory(String),
+    /// A problem with the run itself (paths, options, the relinker), not
+    /// with what the input contains.
+    Run(String),
 }
 
 impl Error {
@@ -16,6 +21,14 @@ impl Error {
 
     pub fn unsupported(message: impl Into<String>) -> Self {
         Error::Unsupported(message.into())
+    }
+
+    pub fn directory(message: impl Into<String>) -> Self {
+        Error::Directory(message.into())
+    }
+
+    pub fn run(message: impl Into<String>) -> Self {
+        Error::Run(message.into())
     }
 
     pub fn io(context: impl Into<String>) -> impl FnOnce(std::io::Error) -> Self {
@@ -30,6 +43,8 @@ impl fmt::Display for Error {
             Error::Io(context, err) => write!(f, "{context}: {err}"),
             Error::Format(message) => write!(f, "invalid package: {message}"),
             Error::Unsupported(message) => write!(f, "unsupported package: {message}"),
+            Error::Directory(message) => write!(f, "invalid game directory: {message}"),
+            Error::Run(message) => write!(f, "{message}"),
         }
     }
 }
