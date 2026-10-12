@@ -41,10 +41,7 @@ pkg-to-anyps5 game.pkg --list
 pkg-to-anyps5 game.pkg out --executables-only
 
 # Use an already-extracted game directory (no .pkg needed)
-pkg-to-anyps5 extracted-game/ out --relink ~/AnyPS5/build
-
-# Executables only (seconds), then relink with an AnyPS5 build
-pkg-to-anyps5 game.pkg out --executables-only --relink ~/AnyPS5/build
+pkg-to-anyps5 extracted-game/ out
 
 # Everything: executables and every game file, with a live progress line
 pkg-to-anyps5 game.pkg out --verbose
@@ -75,7 +72,10 @@ cannot be read.
 
 The input can be either a debug `.pkg` or an existing game directory containing
 `eboot.bin`. Directory input skips package parsing and copies any existing
-`sce_sys/` files from that tree into `app0/`.
+`sce_sys/` files from that tree into `app0/`. Symbolic links are followed (a
+link back into a parent directory is skipped), and sockets, FIFOs and devices
+are skipped with a message. The output directory may contain the input
+directory but not sit inside it.
 
 Output:
 
@@ -112,12 +112,14 @@ packages pad the file-offset table to 16 bytes, others start the u2c table
 right after it. Both placements are tried, and only the one whose blocks cover
 the image exactly is used.
 
-Every inconsistency is an error. The tool never leaves a partial file behind:
-failed writes are removed, and folder copies are written to a temporary file
-before being renamed into place. Files finished before an error stay, so delete
-the output directory after a failed run. Package paths that could leave the
-output directory (`..`, absolute paths) are refused, folder symlinks are skipped,
-and folder input/output directories may not overlap.
+Every inconsistency is an error. The tool never writes a partial or guessed
+file: a file being written when an error occurs is removed. Folder copies are
+written under `<output-dir>/.pkg-to-anyps5-partial/` and renamed into `app0/`
+once complete, so even a killed run leaves no partial file among the game
+files; the next run clears that directory. Files finished before an error
+stay, so delete the output directory after a failed run. Package paths that
+could leave the output directory (`..`, absolute paths) are refused, and sizes
+read from headers are checked before anything is allocated.
 
 ## Tested
 

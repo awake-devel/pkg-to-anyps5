@@ -272,7 +272,9 @@ fn run(options: &Options) -> Result<()> {
             cnt.skipped_encrypted.len()
         ));
         status.phase(Phase::Copying, resources.iter().map(|f| f.size).sum(), resources.len() as u64);
-        let written = copy_resources(&image, &resources, &app0, options.jobs, started, &status)?;
+        let written = copy_resources(&resources, options.jobs, started, &status, |file, _, failed, progress| {
+            copy_one(&image, file, &app0, failed, progress)
+        })?;
         // Counted after the copy: a package file at the same path replaced
         // the CNT copy on disk, and the summary counts each path once.
         for cnt_file in &cnt.files {
@@ -384,6 +386,10 @@ fn write_executables<T: GameFile>(
     Ok(())
 }
 
+/// Holds folder copies while they are written, so a run that is killed
+/// leaves its partial files here and never among the game files in app0/.
+const PARTIAL_DIR: &str = ".pkg-to-anyps5-partial";
+
 fn run_directory(options: &Options) -> Result<()> {
     let started = Instant::now();
     let steps = 2 + u8::from(!options.executables_only) + u8::from(options.relink.is_some());
@@ -396,14 +402,21 @@ fn run_directory(options: &Options) -> Result<()> {
         let output = options.output.as_deref().expect("checked in parse_args");
         let input_path = fs::canonicalize(&options.package).map_err(Error::io(format!("resolve {}", options.package.display())))?;
         let output_path = canonicalize_allow_missing(output)?;
-        if input_path.starts_with(&output_path) || output_path.starts_with(&input_path) {
-            return Err(Error::format("the output directory must not overlap the input directory"));
+        // Output inside the input would be scanned as game files, and input
+        // inside what the tool writes would be overwritten while it is read.
+        // An output directory that merely contains the input is fine.
+        let written = ["source", "app0", "libs", "app.elf", "app.exe", PARTIAL_DIR].map(|p| output_path.join(p));
+        if output_path.starts_with(&input_path) {
+            return Err(Error::format("the output directory must not be the input directory or inside it"));
+        }
+        if let Some(clash) = written.iter().find(|p| input_path.starts_with(p)) {
+            return Err(Error::format(format!("the input directory is inside {}, which this run writes", clash.display())));
         }
         Some(output)
     };
 
     let mut files = Vec::new();
-    collect_directory_files(&options.package, &options.package, &mut files, &status)?;
+    collect_directory_files(&options.package, &options.package, &mut Vec::new(), &mut files, &status)?;
     files.sort_by(|a, b| a.path.cmp(&b.path));
     let total: u64 = files.iter().map(|file| file.size).sum();
     status.line(format!("directory   {}", options.package.display()));
@@ -431,10 +444,17 @@ fn run_directory(options: &Options) -> Result<()> {
     })?;
 
     if !options.executables_only {
-        create_dir(&app0.join("sce_sys"))?;
+        create_dir(&app0)?;
+        let partial = out.join(PARTIAL_DIR);
+        remove_dir_if_present(&partial)?;
+        create_dir(&partial)?;
         status.phase(Phase::Copying, resources.iter().map(|f| f.size).sum(), resources.len() as u64);
-        let written = copy_directory_resources(&options.package, &resources, &app0, options.jobs, started, &status)?;
-        status.line(format!("  app0/  {} files, {:.2} GiB", resources.len(), gib(written)));
+        let written = copy_resources(&resources, options.jobs, started, &status, |file, buffer, failed, progress| {
+            let source = options.package.join(&file.path);
+            copy_file_atomic(&source, &file.output_path(&app0)?, &partial, buffer, failed, progress)
+        });
+        let _ = fs::remove_dir_all(&partial);
+        status.line(format!("  app0/  {} files, {:.2} GiB", resources.len(), gib(written?)));
     }
 
     if let Some(build) = &options.relink {
@@ -445,111 +465,52 @@ fn run_directory(options: &Options) -> Result<()> {
     Ok(())
 }
 
-fn copy_directory_resources(
-    root: &Path,
-    files: &[&DirectoryFile],
-    app0: &Path,
-    jobs: usize,
-    started: Instant,
-    status: &Status,
-) -> Result<u64> {
-    let mut order = files.to_vec();
-    order.sort_by_key(|file| std::cmp::Reverse(file.size));
-    let total: u64 = order.iter().map(|file| file.size).sum();
-    let next = AtomicUsize::new(0);
-    let written = AtomicU64::new(0);
-    let next_report = AtomicU64::new(0);
-    let failed = AtomicBool::new(false);
-    let first_error = Mutex::new(None);
-    std::thread::scope(|scope| {
-        for _ in 0..jobs.max(1) {
-            scope.spawn(|| {
-                while !failed.load(Ordering::Relaxed) {
-                    let Some(file) = order.get(next.fetch_add(1, Ordering::Relaxed)) else { break };
-                    status.set_file(&file.path);
-                    let source = root.join(&file.path);
-                    let target = match join_directory_inside(app0, &file.path) {
-                        Ok(path) => path,
-                        Err(err) => {
-                            failed.store(true, Ordering::Relaxed);
-                            first_error.lock().unwrap().get_or_insert(err);
-                            break;
-                        }
-                    };
-                    let result = copy_file_atomic(&source, &target, &failed, |bytes| {
-                        let done = written.fetch_add(bytes, Ordering::Relaxed) + bytes;
-                        status.advance(bytes);
-                        if status.is_verbose() {
-                            return;
-                        }
-                        let due = next_report.load(Ordering::Relaxed);
-                        if done >= due && next_report.compare_exchange(due, done + (4 << 30), Ordering::Relaxed, Ordering::Relaxed).is_ok()
-                        {
-                            let rate = gib(done) / started.elapsed().as_secs_f64().max(0.001);
-                            status.line(format!("  app0/  {:.2} / {:.2} GiB ({:.2} GiB/s)", gib(done), gib(total), rate));
-                        }
-                    });
-                    match result {
-                        Ok(bytes) => {
-                            status.file_done();
-                            status.wrote(&file.path, bytes);
-                        }
-                        Err(err) => {
-                            failed.store(true, Ordering::Relaxed);
-                            first_error.lock().unwrap().get_or_insert(err);
-                        }
-                    }
-                }
-            });
-        }
-    });
-    match first_error.into_inner().unwrap() {
-        Some(err) => Err(err),
-        None => Ok(written.into_inner()),
-    }
-}
-
 static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
-fn copy_file_atomic(source: &Path, target: &Path, failed: &AtomicBool, mut progress: impl FnMut(u64)) -> Result<u64> {
+/// Copies `source` to a file in `partial`, then renames it to `target`, so
+/// `target` only ever appears complete.
+fn copy_file_atomic(
+    source: &Path,
+    target: &Path,
+    partial: &Path,
+    buffer: &mut Vec<u8>,
+    failed: &AtomicBool,
+    progress: &mut dyn FnMut(u64),
+) -> Result<()> {
     if let Some(parent) = target.parent() {
         create_dir(parent)?;
     }
     let mut input = fs::File::open(source).map_err(Error::io(format!("open {}", source.display())))?;
-    let (temp_path, temp_file) = loop {
-        let id = TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
-        let path = target.with_file_name(format!(".pkg-to-anyps5-{}-{id}.tmp", std::process::id()));
-        match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => break (path, file),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(Error::io(format!("create {}", path.display()))(err)),
-        }
-    };
-    let mut output = BufWriter::with_capacity(4 << 20, temp_file);
-    let mut copied = 0u64;
+    let temp_path = partial.join(format!("{}.tmp", TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed)));
+    let mut output = fs::File::create(&temp_path).map_err(Error::io(format!("create {}", temp_path.display())))?;
+    // Reused across the files of one thread; only zero-filled the first time.
+    buffer.resize(4 << 20, 0);
     let result = (|| {
-        let mut buffer = vec![0; 4 << 20];
         loop {
             if failed.load(Ordering::Relaxed) {
                 return Err(Error::format("stopped after an error in another file"));
             }
-            let count = input.read(&mut buffer).map_err(Error::io(format!("read {}", source.display())))?;
+            let count = input.read(buffer).map_err(Error::io(format!("read {}", source.display())))?;
             if count == 0 {
-                break;
+                return Ok(());
             }
             output.write_all(&buffer[..count]).map_err(Error::io(format!("write {}", target.display())))?;
-            copied += count as u64;
             progress(count as u64);
         }
-        output.flush().map_err(Error::io(format!("write {}", target.display())))?;
-        Ok(())
     })();
     drop(output);
     let result = result.and_then(|()| fs::rename(&temp_path, target).map_err(Error::io(format!("rename {}", target.display()))));
     if result.is_err() {
         let _ = fs::remove_file(&temp_path);
     }
-    result.map(|()| copied)
+    result
+}
+
+fn remove_dir_if_present(path: &Path) -> Result<()> {
+    match fs::remove_dir_all(path) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(Error::io(format!("remove {}", path.display()))(err)),
+        _ => Ok(()),
+    }
 }
 
 fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf> {
@@ -578,38 +539,62 @@ fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf> {
     Ok(resolved)
 }
 
-fn collect_directory_files(root: &Path, directory: &Path, files: &mut Vec<DirectoryFile>, status: &Status) -> Result<()> {
+/// Lists the regular files under `directory`, following symbolic links as
+/// the game would see them. `ancestors` holds the resolved directories being
+/// walked, to stop at a link that loops back into one of them. Sockets,
+/// FIFOs and devices are not game data and are skipped.
+fn collect_directory_files(
+    root: &Path,
+    directory: &Path,
+    ancestors: &mut Vec<PathBuf>,
+    files: &mut Vec<DirectoryFile>,
+    status: &Status,
+) -> Result<()> {
+    let resolved = fs::canonicalize(directory).map_err(Error::io(format!("resolve {}", directory.display())))?;
+    if ancestors.contains(&resolved) {
+        status.line(format!("  skipped {}: a symbolic link back into a parent directory", directory.display()));
+        return Ok(());
+    }
+    ancestors.push(resolved);
     for entry in fs::read_dir(directory).map_err(Error::io(format!("list {}", directory.display())))? {
         let entry = entry.map_err(Error::io(format!("list {}", directory.display())))?;
         let path = entry.path();
-        let file_type = entry.file_type().map_err(Error::io(format!("inspect {}", path.display())))?;
-        if file_type.is_dir() {
-            collect_directory_files(root, &path, files, status)?;
-        } else if file_type.is_symlink() {
-            status.line(format!("  skipped symbolic link {}", path.display()));
-        } else if file_type.is_file() {
+        // fs::metadata follows links; a dangling one fails here with its path.
+        let metadata = fs::metadata(&path).map_err(Error::io(format!("inspect {}", path.display())))?;
+        if metadata.is_dir() {
+            collect_directory_files(root, &path, ancestors, files, status)?;
+        } else if metadata.is_file() {
             let relative = path.strip_prefix(root).expect("walked below root");
-            let relative = relative.to_str().ok_or_else(|| Error::format("directory contains a non-UTF-8 path"))?;
+            let relative = relative.to_str().ok_or_else(|| Error::unsupported(format!("{} is not a UTF-8 path", path.display())))?;
             #[cfg(windows)]
             let relative = relative.replace('\\', "/");
             #[cfg(not(windows))]
             let relative = relative.to_owned();
+            // Checked now so an unsafe name fails before anything is written.
             join_directory_inside(Path::new(""), &relative)?;
-            let size = entry.metadata().map_err(Error::io(format!("inspect {}", path.display())))?.len();
-            files.push(DirectoryFile { path: relative, size });
+            files.push(DirectoryFile { path: relative, size: metadata.len() });
         } else {
-            return Err(Error::unsupported(format!("{} is not a regular file or directory", path.display())));
+            status.line(format!("  skipped {}: not a regular file or directory", path.display()));
         }
     }
+    ancestors.pop();
     Ok(())
 }
 
 /// Copies files on `jobs` threads, largest first so the long files start
-/// early. The first error stops the other threads and is returned.
-fn copy_resources(image: &InnerImage, files: &[&InnerFile], app0: &Path, jobs: usize, started: Instant, status: &Status) -> Result<u64> {
-    let mut order: Vec<&InnerFile> = files.to_vec();
-    order.sort_by_key(|f| std::cmp::Reverse(f.size));
-    let total: u64 = order.iter().map(|f| f.size).sum();
+/// early. `copy` writes one file, reporting bytes to its progress callback
+/// and stopping once `failed` is set; each thread lends it one reusable
+/// buffer. The first error stops the other threads and is returned.
+fn copy_resources<T: GameFile + Sync>(
+    files: &[&T],
+    jobs: usize,
+    started: Instant,
+    status: &Status,
+    copy: impl Fn(&T, &mut Vec<u8>, &AtomicBool, &mut dyn FnMut(u64)) -> Result<()> + Sync,
+) -> Result<u64> {
+    let mut order: Vec<&T> = files.to_vec();
+    order.sort_by_key(|f| std::cmp::Reverse(f.size()));
+    let total: u64 = order.iter().map(|f| f.size()).sum();
     let next = AtomicUsize::new(0);
     let written = AtomicU64::new(0);
     let next_report = AtomicU64::new(0);
@@ -618,10 +603,11 @@ fn copy_resources(image: &InnerImage, files: &[&InnerFile], app0: &Path, jobs: u
     std::thread::scope(|scope| {
         for _ in 0..jobs.max(1) {
             scope.spawn(|| {
+                let mut buffer = Vec::new();
                 while !failed.load(Ordering::Relaxed) {
                     let Some(file) = order.get(next.fetch_add(1, Ordering::Relaxed)) else { break };
-                    status.set_file(&file.path);
-                    let result = copy_one(image, file, app0, &failed, |n| {
+                    status.set_file(file.path());
+                    let mut progress = |n| {
                         let done = written.fetch_add(n, Ordering::Relaxed) + n;
                         status.advance(n);
                         // The status line shows progress continuously.
@@ -632,13 +618,13 @@ fn copy_resources(image: &InnerImage, files: &[&InnerFile], app0: &Path, jobs: u
                         if done >= due && next_report.compare_exchange(due, done + (4 << 30), Ordering::Relaxed, Ordering::Relaxed).is_ok()
                         {
                             let rate = gib(done) / started.elapsed().as_secs_f64().max(0.001);
-                            println!("  app0/  {:.2} / {:.2} GiB ({:.2} GiB/s)", gib(done), gib(total), rate);
+                            status.line(format!("  app0/  {:.2} / {:.2} GiB ({:.2} GiB/s)", gib(done), gib(total), rate));
                         }
-                    });
-                    match result {
+                    };
+                    match copy(file, &mut buffer, &failed, &mut progress) {
                         Ok(()) => {
                             status.file_done();
-                            status.wrote(&file.path, file.size);
+                            status.wrote(file.path(), file.size());
                         }
                         Err(err) => {
                             failed.store(true, Ordering::Relaxed);
@@ -655,7 +641,7 @@ fn copy_resources(image: &InnerImage, files: &[&InnerFile], app0: &Path, jobs: u
     }
 }
 
-fn copy_one(image: &InnerImage, file: &InnerFile, app0: &Path, failed: &AtomicBool, mut progress: impl FnMut(u64)) -> Result<()> {
+fn copy_one(image: &InnerImage, file: &InnerFile, app0: &Path, failed: &AtomicBool, progress: &mut dyn FnMut(u64)) -> Result<()> {
     let target = join_inside(app0, &file.path)?;
     if let Some(parent) = target.parent() {
         create_dir(parent)?;
@@ -689,10 +675,10 @@ fn join_inside(base: &Path, relative: &str) -> Result<PathBuf> {
     Ok(base.join(relative))
 }
 
+/// Like `join_inside` for a path read from an input directory, where `\` and
+/// `:` are ordinary characters of a Unix file name.
 fn join_directory_inside(base: &Path, relative: &str) -> Result<PathBuf> {
-    let plain_relative =
-        !relative.is_empty() && !relative.contains('\0') && relative.split('/').all(|part| !part.is_empty() && part != "." && part != "..");
-    if !plain_relative || (cfg!(windows) && !is_windows_safe_path(relative)) {
+    if !fih::has_plain_components(relative) || (cfg!(windows) && !is_windows_safe_path(relative)) {
         return Err(Error::format(format!("refusing to write the unsafe directory path {relative:?}")));
     }
     Ok(base.join(relative))
@@ -801,8 +787,11 @@ mod tests {
 
     impl TestDirectory {
         fn new() -> Self {
-            let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-            let path = std::env::temp_dir().join(format!("pkg-to-anyps5-test-{}-{unique}", std::process::id()));
+            // Tests run in parallel threads of one process; the counter keeps
+            // their directories apart.
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("pkg-to-anyps5-test-{}-{id}", std::process::id()));
             fs::create_dir_all(&path).unwrap();
             Self(path)
         }
@@ -861,7 +850,7 @@ mod tests {
 
         let mut files = Vec::new();
         let status = Status::new(false, 1, Instant::now());
-        collect_directory_files(root, root, &mut files, &status).unwrap();
+        collect_directory_files(root, root, &mut Vec::new(), &mut files, &status).unwrap();
         status.close();
         files.sort_by(|a, b| a.path.cmp(&b.path));
 
@@ -959,11 +948,119 @@ mod tests {
         let source = temp.0.join("source.bin");
         let target = temp.0.join("out.bin");
         fs::write(&source, b"source").unwrap();
+        let partial = temp.0.join("partial");
+        fs::create_dir(&partial).unwrap();
         let failed = AtomicBool::new(true);
 
-        assert!(copy_file_atomic(&source, &target, &failed, |_| {}).is_err());
+        assert!(copy_file_atomic(&source, &target, &partial, &mut Vec::new(), &failed, &mut |_| {}).is_err());
         assert!(!target.exists());
-        assert_eq!(fs::read_dir(&temp.0).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&partial).unwrap().count(), 0);
+    }
+
+    fn directory_options(input: PathBuf, output: PathBuf) -> Options {
+        Options {
+            package: input,
+            output: Some(output),
+            list: false,
+            executables_only: false,
+            relink: None,
+            windows: false,
+            only: Vec::new(),
+            module_dirs: Vec::new(),
+            jobs: 2,
+            verbose: false,
+        }
+    }
+
+    #[test]
+    fn directory_mode_accepts_output_that_contains_the_input() {
+        let temp = TestDirectory::new();
+        let input = temp.0.join("game");
+        fs::create_dir_all(&input).unwrap();
+        fs::write(input.join("eboot.bin"), b"\x7fELF").unwrap();
+        fs::write(input.join("data.bin"), b"data").unwrap();
+
+        run_directory(&directory_options(input, temp.0.clone())).unwrap();
+
+        assert_eq!(fs::read(temp.0.join("app0/data.bin")).unwrap(), b"data");
+        assert!(!temp.0.join(PARTIAL_DIR).exists());
+        assert!(!temp.0.join("app0/sce_sys").exists());
+    }
+
+    #[test]
+    fn directory_mode_rejects_input_inside_what_it_writes() {
+        let temp = TestDirectory::new();
+        let input = temp.0.join("app0/game");
+        fs::create_dir_all(&input).unwrap();
+        fs::write(input.join("eboot.bin"), b"\x7fELF").unwrap();
+
+        assert!(run_directory(&directory_options(input.clone(), temp.0.clone())).is_err());
+        assert!(input.join("eboot.bin").exists());
+    }
+
+    #[test]
+    fn directory_mode_clears_partial_files_of_a_killed_run() {
+        let temp = TestDirectory::new();
+        let input = temp.0.join("game");
+        let output = temp.0.join("out");
+        fs::create_dir_all(&input).unwrap();
+        fs::create_dir_all(output.join(PARTIAL_DIR)).unwrap();
+        fs::write(output.join(PARTIAL_DIR).join("0.tmp"), b"stale").unwrap();
+        fs::write(input.join("eboot.bin"), b"\x7fELF").unwrap();
+
+        run_directory(&directory_options(input, output.clone())).unwrap();
+
+        assert!(!output.join(PARTIAL_DIR).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_mode_follows_symbolic_links_and_stops_at_loops() {
+        let temp = TestDirectory::new();
+        let input = temp.0.join("game");
+        let elsewhere = temp.0.join("elsewhere");
+        let output = temp.0.join("out");
+        fs::create_dir_all(input.join("Media")).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(elsewhere.join("eboot.bin"), b"\x7fELF").unwrap();
+        fs::write(elsewhere.join("level0"), b"level").unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("eboot.bin"), input.join("eboot.bin")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, input.join("Media/linked")).unwrap();
+        std::os::unix::fs::symlink(&input, input.join("Media/loop")).unwrap();
+
+        run_directory(&directory_options(input, output.clone())).unwrap();
+
+        assert_eq!(fs::read(output.join("source/eboot.bin")).unwrap(), b"\x7fELF");
+        assert_eq!(fs::read(output.join("app0/Media/linked/level0")).unwrap(), b"level");
+        assert!(!output.join("app0/Media/loop").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_mode_names_a_dangling_link() {
+        let temp = TestDirectory::new();
+        let input = temp.0.join("game");
+        fs::create_dir_all(&input).unwrap();
+        std::os::unix::fs::symlink(temp.0.join("missing"), input.join("eboot.bin")).unwrap();
+
+        let err = run_directory(&directory_options(input, temp.0.join("out"))).unwrap_err();
+        assert!(err.to_string().contains("eboot.bin"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_mode_skips_sockets_and_fifos() {
+        let temp = TestDirectory::new();
+        let input = temp.0.join("game");
+        fs::create_dir_all(&input).unwrap();
+        fs::write(input.join("eboot.bin"), b"\x7fELF").unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(input.join("debug.sock")).unwrap();
+
+        let mut files = Vec::new();
+        let status = Status::new(false, 1, Instant::now());
+        collect_directory_files(&input, &input, &mut Vec::new(), &mut files, &status).unwrap();
+        status.close();
+        assert_eq!(files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["eboot.bin"]);
     }
 
     #[cfg(unix)]
