@@ -1,13 +1,16 @@
 # pkg-to-anyps5
 
-Extracts a PS5 debug package (`.pkg` with the `\x7FFIH` header) into the
-layout the [AnyPS5](https://github.com/boykopovar/AnyPS5) relinker takes as
-input and the layout its output runs from.
+Extracts a PS5 debug package (`.pkg` with the `\x7FFIH` header), or a game
+folder that is already extracted, into the layout the
+[AnyPS5](https://github.com/boykopovar/AnyPS5) relinker takes as input and the
+layout its output runs from.
 
 AnyPS5 converts a plain ELF `eboot.bin` plus the game's modules. A package
 stores them as fake-signed SELF files inside a compressed filesystem image, so
 this tool unpacks the image, unwraps every SELF into an ELF, and lays the
-files out for the relinker.
+files out for the relinker. A game folder gets the same treatment without the
+package step: its executables are unwrapped into `source/` and the rest is
+copied into `app0/`.
 
 ## Install
 
@@ -34,14 +37,14 @@ guide.
 ## Use
 
 ```sh
-# What is in the package
+# What is in the package (or a game folder)
 pkg-to-anyps5 game.pkg --list
 
 # Executables only (seconds)
 pkg-to-anyps5 game.pkg out --executables-only
 
-# Use an already-extracted game directory (no .pkg needed)
-pkg-to-anyps5 extracted-game/ out
+# An already-extracted game folder instead of a package
+pkg-to-anyps5 game-folder/ out
 
 # Everything: executables and every game file, with a live progress line
 pkg-to-anyps5 game.pkg out --verbose
@@ -53,7 +56,9 @@ pkg-to-anyps5 game.pkg out --verbose
 > **Deprecated:** `--relink`, and `--module-dir` and `--windows` with it, are
 > no longer maintained and will be removed in v1. They still work for now and
 > print a warning. Run the AnyPS5 relinker yourself on
-> `<output-dir>/source/eboot.bin` instead.
+> `<output-dir>/source/eboot.bin` instead. If you rely on `--relink`, say so in
+> the [discussion about keeping it](https://github.com/awake-devel/pkg-to-anyps5/discussions/3): 👍 to keep it, 👎 if you don't mind it
+> going.
 
 | Option | Effect |
 |---|---|
@@ -61,21 +66,14 @@ pkg-to-anyps5 game.pkg out --verbose
 | `--executables-only` | Write `source/` only (seconds instead of a full copy). |
 | `--jobs <n>` | Files decoded or copied at once (default 4). |
 | `--only <path>` | Write only the `app0/` files at or under a path (repeatable), to check a few files without copying a whole game. |
-| `--relink <build-dir>` | **Deprecated, removed in v1.** Afterwards run `<build-dir>/core/relinker/relinker` (`relinker.exe` on Windows) on `source/eboot.bin` to make `app.elf`, and copy AnyPS5's system libraries into `libs/`. |
+| `--relink <build-dir>` | **Deprecated, removed in v1** ([discussion](https://github.com/awake-devel/pkg-to-anyps5/discussions/3)). Afterwards run `<build-dir>/core/relinker/relinker` (`relinker.exe` on Windows) on `source/eboot.bin` to make `app.elf`, and copy AnyPS5's system libraries into `libs/`. |
 | `--module-dir <dir>` | **Deprecated with `--relink`.** With `--relink`: also convert the modules of the input tree that the game loads at run time, such as Unity's `Media/Plugins` (needs a relinker with `--module-dir`). Repeatable. |
 | `--windows` | **Deprecated with `--relink`.** With `--relink`: produce `app.exe` for Windows instead. |
 | `-v`, `--verbose` | Show a live status line while converting: the phase, a progress bar, bytes done, speed, ETA and the file being written, ending with a one-line summary. Without a terminal, or with `NO_COLOR` set, it prints plain progress lines instead. |
 | `-h`, `--help` / `-V`, `--version` | Print help or the version. |
 
 Exit status is 0 on success, 1 for a usage error and 2 when the input
-cannot be read.
-
-The input can be either a debug `.pkg` or an existing game directory containing
-`eboot.bin`. Directory input skips package parsing and copies any existing
-`sce_sys/` files from that tree into `app0/`. Symbolic links are followed (a
-link back into a parent directory is skipped), and sockets, FIFOs and devices
-are skipped with a message. The output directory may contain the input
-directory but not sit inside it.
+cannot be read or converted.
 
 Output:
 
@@ -95,6 +93,28 @@ out/
 anywhere beside its input and writes the converted module to the same relative
 path under `app0/` with a `.guest.prx` suffix. That is also where AnyPS5's
 module loader looks when the game opens `/app0/<path>.prx`.
+
+## Folder input
+
+Pass a folder instead of a `.pkg` and the tool converts that folder: the game
+tree as it sits in `/app0` on the console, with `eboot.bin` at the top. Every
+option works the same as with a package.
+
+- `eboot.bin`, `sce_module/*.prx` and the other game modules are unwrapped
+  into `source/`. They can be fake-signed SELF files or plain ELF files.
+- Every other file, including `sce_sys/` if the folder has one, is copied into
+  `app0/`, `--jobs` files at a time.
+- Symbolic links are followed. A link back into a parent folder is skipped, and
+  a link to a missing file is an error that names it.
+- Sockets, FIFOs and devices are skipped with a message.
+- The output folder may contain the game folder (`pkg-to-anyps5 game .`), but
+  may not be the game folder or sit inside it. A game folder inside the
+  output's `source/`, `app0/` or `libs/` is refused too, since the run would
+  overwrite it.
+
+Converting a folder gives the same output as converting the package it came
+from: a folder rebuilt from an extracted package converts to byte-identical
+`source/` and `app0/`.
 
 ## What it reads
 
@@ -127,6 +147,7 @@ read from headers are checked before anything is allocated.
 |---|---|
 | Large package: 93 GB, 172 files, 134 GiB unpacked, 450,700 Kraken blocks | Full extraction in 10 min 39 s with the default 4 jobs (avg 216 MiB/s, peak memory 345 MiB). All 172 files present at their listed sizes, all 90 movies with valid Bink headers, executables relinked. |
 | Unity package: 2.4 GB, 2,144 files, 7.7 GiB unpacked, one sparse block | Full extraction in about 7 s (avg 1.1 GiB/s); with relink 24 s, seven guest modules built. |
+| The same Unity game as a folder: 2,176 files, 7.8 GiB | Converted in about 12 s, byte-identical to the package's output. Also checked: symbolic links to `eboot.bin` and to a folder, a run killed mid-copy and run again, and an output folder that contains the game folder. |
 
 How far a game runs is up to AnyPS5. Both packages stop at load time on a
 system function it does not implement yet.
