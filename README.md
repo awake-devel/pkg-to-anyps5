@@ -40,6 +40,9 @@ pkg-to-anyps5 game.pkg --list
 # Executables only (seconds)
 pkg-to-anyps5 game.pkg out --executables-only
 
+# Use an already-extracted game directory (no .pkg needed)
+pkg-to-anyps5 extracted-game/ out
+
 # Everything: executables and every game file, with a live progress line
 pkg-to-anyps5 game.pkg out --verbose
 
@@ -54,18 +57,25 @@ pkg-to-anyps5 game.pkg out --verbose
 
 | Option | Effect |
 |---|---|
-| `--list` | Print the package's files and sizes; write nothing. |
+| `--list` | Print the input's files and sizes; write nothing. |
 | `--executables-only` | Write `source/` only (seconds instead of a full copy). |
-| `--jobs <n>` | Files decoded at once (default 4). |
+| `--jobs <n>` | Files decoded or copied at once (default 4). |
 | `--only <path>` | Write only the `app0/` files at or under a path (repeatable), to check a few files without copying a whole game. |
 | `--relink <build-dir>` | **Deprecated, removed in v1.** Afterwards run `<build-dir>/core/relinker/relinker` (`relinker.exe` on Windows) on `source/eboot.bin` to make `app.elf`, and copy AnyPS5's system libraries into `libs/`. |
-| `--module-dir <dir>` | **Deprecated with `--relink`.** With `--relink`: also convert the modules of this package directory that the game loads at run time, such as Unity's `Media/Plugins` (needs a relinker with `--module-dir`). Repeatable. |
+| `--module-dir <dir>` | **Deprecated with `--relink`.** With `--relink`: also convert the modules of the input tree that the game loads at run time, such as Unity's `Media/Plugins` (needs a relinker with `--module-dir`). Repeatable. |
 | `--windows` | **Deprecated with `--relink`.** With `--relink`: produce `app.exe` for Windows instead. |
 | `-v`, `--verbose` | Show a live status line while converting: the phase, a progress bar, bytes done, speed, ETA and the file being written, ending with a one-line summary. Without a terminal, or with `NO_COLOR` set, it prints plain progress lines instead. |
 | `-h`, `--help` / `-V`, `--version` | Print help or the version. |
 
-Exit status is 0 on success, 1 for a usage error and 2 when the package
+Exit status is 0 on success, 1 for a usage error and 2 when the input
 cannot be read.
+
+The input can be either a debug `.pkg` or an existing game directory containing
+`eboot.bin`. Directory input skips package parsing and copies any existing
+`sce_sys/` files from that tree into `app0/`. Symbolic links are followed (a
+link back into a parent directory is skipped), and sockets, FIFOs and devices
+are skipped with a message. The output directory may contain the input
+directory but not sit inside it.
 
 Output:
 
@@ -103,8 +113,11 @@ right after it. Both placements are tried, and only the one whose blocks cover
 the image exactly is used.
 
 Every inconsistency is an error. The tool never writes a partial or guessed
-file: a file being written when an error occurs is removed. Files finished
-before the error stay, so delete the output directory after a failed run. Package paths that
+file: a file being written when an error occurs is removed. Folder copies are
+written under `<output-dir>/.pkg-to-anyps5-partial/` and renamed into `app0/`
+once complete, so even a killed run leaves no partial file among the game
+files; the next run clears that directory. Files finished before an error
+stay, so delete the output directory after a failed run. Package paths that
 could leave the output directory (`..`, absolute paths) are refused, and sizes
 read from headers are checked before anything is allocated.
 

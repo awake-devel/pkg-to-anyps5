@@ -169,7 +169,13 @@ fn entry_name(names: &[u8], entry: &CntEntry) -> String {
 /// A `/`-separated path that stays inside the directory it is joined to: no
 /// empty, `.` or `..` components, no backslashes, drive letters or NULs.
 pub fn is_plain_relative_path(path: &str) -> bool {
-    !path.is_empty() && !path.contains(['\\', ':', '\0']) && path.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
+    !path.contains(['\\', ':']) && has_plain_components(path)
+}
+
+/// A non-empty `/`-separated path with no empty, `.` or `..` components and
+/// no NULs.
+pub fn has_plain_components(path: &str) -> bool {
+    !path.is_empty() && !path.contains('\0') && path.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 fn well_known_name(id: u32) -> &'static str {
